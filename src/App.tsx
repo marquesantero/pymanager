@@ -29,6 +29,9 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("All");
   const [message, setMessage] = useState("");
+  const [zoomLevel, setZoomLevel] = useState(100);
+  const [isInitialLoading, setIsInitialLoading] = useState(true);
+
   const [selectedVenv, setSelectedVenv] = useState<VenvInfo | null>(null);
   const [venvDetails, setVenvDetails] = useState<VenvDetails | null>(null);
   const [studioTab, setStudioTab] = useState<StudioTabId | "deploy">("packages");
@@ -51,6 +54,7 @@ export default function App() {
         if (py.length > 0) setSelectedPython(py[0].split('|')[0]);
         setCustomTemplates(await dbService.getCustomTemplates());
       } catch (err) { console.error(err); }
+      finally { setIsInitialLoading(false); }
     };
     load();
   }, []);
@@ -62,6 +66,16 @@ export default function App() {
     apply();
     if (theme === "system") { media.addEventListener("change", apply); return () => media.removeEventListener("change", apply); }
   }, [theme]);
+
+  useEffect(() => {
+    // We apply scaling to the root body or a wrapper to ensure everything (px and rem) scales
+    const root = document.getElementById("root-container");
+    if (root) {
+      root.style.zoom = `${zoomLevel}%`;
+      // For browsers that don't support zoom (like some old WebKits), 
+      // we can use transform, but zoom is cleaner for layouts.
+    }
+  }, [zoomLevel]);
 
   const scanWorkspace = async (p: string) => {
     if (!p) return; setLoading(true); setMessage(`Scanning...`);
@@ -105,8 +119,40 @@ export default function App() {
     broken: (venvCache[activeWorkspace] || []).filter(v => v.status === "Broken").length 
   };
 
+  const allTemplates = [...PYTHON_TEMPLATES, ...customTemplates];
+
+  if (isInitialLoading) {
+    return (
+      <div className="h-screen w-screen bg-slate-100 dark:bg-slate-950 flex flex-col items-center justify-center transition-colors duration-500">
+        <div className="relative">
+          <div className="p-6 bg-blue-600 rounded-[2rem] text-white shadow-2xl shadow-blue-500/40 animate-bounce">
+            <Package size={48} />
+          </div>
+          <div className="absolute inset-0 bg-blue-400 rounded-[2rem] animate-ping opacity-20"></div>
+        </div>
+        <div className="mt-10 flex flex-col items-center gap-2">
+          <h2 className="text-xl font-black uppercase tracking-[0.3em] text-slate-800 dark:text-white animate-pulse">PyManager</h2>
+          <div className="flex items-center gap-3">
+            <div className="w-12 h-1 bg-slate-200 dark:bg-slate-800 rounded-full overflow-hidden">
+              <div className="w-full h-full bg-blue-600 origin-left animate-[loading_1.5s_ease-in-out_infinite]"></div>
+            </div>
+            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Initializing Engine</span>
+          </div>
+        </div>
+        <style dangerouslySetInnerHTML={{ __html: `
+          @keyframes loading {
+            0% { transform: scaleX(0); }
+            50% { transform: scaleX(1); }
+            100% { transform: scaleX(0); transform-origin: right; }
+          }
+        `}} />
+      </div>
+    );
+  }
+
   return (
-    <div className="flex h-screen bg-slate-100 dark:bg-slate-950 text-slate-800 dark:text-slate-50 font-sans overflow-hidden transition-colors">
+    <div id="root-container" className="flex h-screen bg-slate-100 dark:bg-slate-950 text-slate-800 dark:text-slate-50 font-sans overflow-hidden transition-colors duration-200 origin-top-left">
+
       <Sidebar 
         theme={theme} setTheme={setTheme} workspaces={workspaces} activeWorkspace={activeWorkspace} 
         setActiveWorkspace={setActiveWorkspace} scanWorkspace={scanWorkspace}
@@ -124,7 +170,14 @@ export default function App() {
 
       <main className="flex-1 flex flex-col relative overflow-hidden">
         <header className="h-14 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between px-8 bg-white dark:bg-slate-950/50 shrink-0 select-none">
-          <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg py-1.5 px-4 text-xs w-64 outline-none focus:border-blue-500" placeholder="Search..." />
+          <div className="flex items-center gap-4">
+            <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} className="bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg py-1.5 px-4 text-xs w-64 outline-none focus:border-blue-500" placeholder="Search..." />
+            <div className="flex items-center bg-slate-100 dark:bg-slate-900 rounded-lg border border-slate-200 dark:border-slate-800 p-0.5">
+              <button onClick={() => setZoomLevel(prev => Math.max(70, prev - 5))} className="px-2 py-1 text-[10px] font-black hover:text-blue-600 transition-colors" title="Decrease Font Size">A-</button>
+              <div className="w-px h-3 bg-slate-300 dark:bg-slate-700 mx-1"></div>
+              <button onClick={() => setZoomLevel(prev => Math.min(150, prev + 5))} className="px-2 py-1 text-[10px] font-black hover:text-blue-600 transition-colors" title="Increase Font Size">A+</button>
+            </div>
+          </div>
           <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400 uppercase">
             <span>{stats.total} Total</span> <span className="text-green-600">{stats.healthy} OK</span> <span className="text-red-600">{stats.broken} Broken</span>
           </div>
@@ -133,20 +186,23 @@ export default function App() {
           </div>
         </header>
 
-        <div className="px-8 py-3 bg-white dark:bg-slate-900/30 border-b border-slate-200 dark:border-slate-800 flex items-center gap-3 shrink-0 select-none font-bold">
-            <p className="text-[9px] font-black uppercase text-slate-400">New Env</p>
-            <input value={newVenvName} onChange={(e) => setNewVenvName(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-3 py-1 text-xs w-32 outline-none focus:border-blue-500" placeholder="Name..." />
-            <select value={selectedPython} onChange={(e) => setSelectedPython(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs text-blue-600">{systemPythons.map(p => <option key={p.split('|')[0]} value={p.split('|')[0]}>{p.split('|')[1]}</option>)}</select>
-            <select value={selectedTemplate.id} onChange={(e) => setSelectedTemplate([...PYTHON_TEMPLATES, ...customTemplates].find(t => t.id === e.target.value) || PYTHON_TEMPLATES[0])} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs">{[...PYTHON_TEMPLATES, ...customTemplates].map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
-            <button onClick={async () => {
-              if (!newVenvName || !activeWorkspace) return; setLoading(true);
-              try {
-                await invoke("create_venv", { path: activeWorkspace, name: newVenvName, pythonBin: selectedPython });
-                for (const pkg of selectedTemplate.pkgs) { await invoke("install_dependency", { venvPath: `${activeWorkspace}/${newVenvName}`, package: pkg }); }
-                setNewVenvName(""); scanWorkspace(activeWorkspace);
-              } catch (e) { setMessage(`Error: ${e}`); } finally { setLoading(false); }
-            }} disabled={loading || !newVenvName} className="bg-blue-600 text-white px-4 py-1 rounded-md text-[10px] font-black uppercase shadow-sm active:scale-95 transition-all">{loading ? <Loader2 size={10} className="animate-spin"/> : "Build"}</button>
-            {message && <p className="text-[9px] font-black text-blue-500 truncate ml-auto uppercase">{message}</p>}
+        <div className="px-8 py-3 bg-white dark:bg-slate-900/30 border-b border-slate-200 dark:border-slate-800 flex flex-col gap-2 shrink-0 select-none font-bold">
+            <div className="flex items-center gap-3">
+                <p className="text-[9px] font-black uppercase text-slate-400">New Env</p>
+                <input value={newVenvName} onChange={(e) => setNewVenvName(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-3 py-1 text-xs w-64 outline-none focus:border-blue-500" placeholder="Name..." />
+                <select value={selectedPython} onChange={(e) => setSelectedPython(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs text-blue-600">{systemPythons.map(p => <option key={p.split('|')[0]} value={p.split('|')[0]}>{p.split('|')[1]}</option>)}</select>
+                <select value={selectedTemplate.id} onChange={(e) => setSelectedTemplate([...PYTHON_TEMPLATES, ...customTemplates].find(t => t.id === e.target.value) || PYTHON_TEMPLATES[0])} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs">{[...PYTHON_TEMPLATES, ...customTemplates].map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+                <button onClick={async () => {
+                  if (!newVenvName || !activeWorkspace) return; setLoading(true);
+                  try {
+                    await invoke("create_venv", { path: activeWorkspace, name: newVenvName, pythonBin: selectedPython });
+                    for (const pkg of selectedTemplate.pkgs) { await invoke("install_dependency", { venvPath: `${activeWorkspace}/${newVenvName}`, package: pkg }); }
+                    setNewVenvName(""); scanWorkspace(activeWorkspace);
+                  } catch (e) { setMessage(`Error: ${e}`); } finally { setLoading(false); }
+                }} disabled={loading || !newVenvName} className="bg-blue-600 text-white px-4 py-1 rounded-md text-[10px] font-black uppercase shadow-sm active:scale-95 transition-all">{loading ? <Loader2 size={10} className="animate-spin"/> : "Build"}</button>
+                {message && <p className="text-[9px] font-black text-blue-500 truncate ml-auto uppercase">{message}</p>}
+            </div>
+            {selectedPython && <p className="text-[9px] text-slate-400 font-mono ml-[52px] truncate opacity-70">Binary: {selectedPython}</p>}
         </div>
 
         <div className="flex-1 overflow-y-auto p-8 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4 items-start pb-20">

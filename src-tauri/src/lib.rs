@@ -191,12 +191,49 @@ fn get_pyvenv_cfg(venv_path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn list_system_pythons() -> Vec<String> {
-    let mut found = Vec::new();
-    let paths = ["/usr/bin/python3", "/usr/bin/python", "/usr/local/bin/python3"];
-    for p in paths {
-        if Path::new(p).exists() { if let Ok(out) = Command::new(p).arg("--version").output() { found.push(format!("{}|{}", p, String::from_utf8_lossy(&out.stdout).trim())); } }
+    let mut found_versions = HashMap::new(); // version_string -> path
+    
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::env::split_paths(&path_var);
+
+    for dir in paths {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let name_low = name.to_lowercase();
+                
+                // Match: python, python3, python3.x, python.exe, etc.
+                // Avoid: python-config, python3-config, pip, etc.
+                let is_python = (name_low == "python" || name_low == "python.exe" || 
+                                 name_low == "python3" || name_low == "python3.exe" ||
+                                 (name_low.starts_with("python3.") && name_low.chars().nth(8).map_or(false, |c| c.is_ascii_digit())))
+                                && !name_low.contains("-config");
+
+                if is_python {
+                    let p = entry.path();
+                    if let Ok(out) = Command::new(&p).arg("--version").output() {
+                        if out.status.success() {
+                            let version = if out.stdout.is_empty() {
+                                String::from_utf8_lossy(&out.stderr)
+                            } else {
+                                String::from_utf8_lossy(&out.stdout)
+                            }.trim().to_string();
+
+                            if !version.is_empty() {
+                                // Deduplicate: prefer paths with numbers (specific versions)
+                                let current_path = p.to_string_lossy().to_string();
+                                if !found_versions.contains_key(&version) || current_path.contains(".") {
+                                    found_versions.insert(version, current_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
-    found
+    
+    found_versions.into_iter().map(|(v, p)| format!("{}|{}", p, v)).collect()
 }
 
 #[tauri::command]
