@@ -70,28 +70,6 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
 }
 
 #[tauri::command]
-fn list_venvs(base_path: String) -> Result<Vec<VenvInfo>, String> {
-    let mut venvs = Vec::new();
-    let root = Path::new(&base_path);
-    if !root.is_dir() { return Err("Invalid directory path".to_string()); }
-
-    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
-        let name = e.file_name().to_string_lossy();
-        // Skip common heavy folders but ALLOW .venv
-        if name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" { return false; }
-        if name.starts_with('.') && name != ".venv" { return false; }
-        true
-    });
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        if let Some(info) = get_venv_info(entry.path()) { venvs.push(info); }
-    }
-    Ok(venvs)
-}
-
-// --- Other commands (Open, Create, Install, Details, etc.) ---
-
-#[tauri::command]
 fn check_venv_health(venv_path: String) -> Result<String, String> {
     let pip = get_pip_path(Path::new(&venv_path));
     let out = Command::new(pip).arg("check").output().map_err(|e| e.to_string())?;
@@ -103,6 +81,12 @@ fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage>, Str
     let pip = get_pip_path(Path::new(&venv_path));
     let out = Command::new(pip).args(["list", "--outdated", "--format=json"]).output().map_err(|e| e.to_string())?;
     if out.status.success() { let pkgs: Vec<OutdatedPackage> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?; Ok(pkgs) } else { Ok(Vec::new()) }
+}
+
+#[tauri::command]
+fn get_pyvenv_cfg(venv_path: String) -> Result<String, String> {
+    let path = Path::new(&venv_path).join("pyvenv.cfg");
+    if path.exists() { fs::read_to_string(path).map_err(|e| e.to_string()) } else { Err("pyvenv.cfg not found".into()) }
 }
 
 #[tauri::command]
@@ -168,6 +152,23 @@ fn scan_venv(path: String) -> Result<VenvInfo, String> {
 }
 
 #[tauri::command]
+fn list_venvs(base_path: String) -> Result<Vec<VenvInfo>, String> {
+    let mut venvs = Vec::new();
+    let root = Path::new(&base_path);
+    if !root.is_dir() { return Err("Invalid directory path".to_string()); }
+    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        if name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" { return false; }
+        if name.starts_with('.') && name != ".venv" { return false; }
+        true
+    });
+    for entry in walker.filter_map(|e| e.ok()) {
+        if let Some(info) = get_venv_info(entry.path()) { venvs.push(info); }
+    }
+    Ok(venvs)
+}
+
+#[tauri::command]
 fn create_venv(path: String, name: String, python_bin: String) -> Result<String, String> {
     let mut full_path = PathBuf::from(&path);
     full_path.push(&name);
@@ -222,12 +223,37 @@ fn purge_pip_cache() -> Result<String, String> {
     if out.status.success() { Ok("Pip cache cleared".into()) } else { Err(String::from_utf8_lossy(&out.stderr).to_string()) }
 }
 
+#[tauri::command]
+fn export_requirements(venv_path: String) -> Result<String, String> {
+    let pip = get_pip_path(Path::new(&venv_path));
+    let pb = PathBuf::from(&venv_path);
+    let project_root = pb.parent().unwrap_or(Path::new(&venv_path));
+    let req_path = project_root.join("requirements.txt");
+    let out = Command::new(pip).args(["freeze"]).output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        fs::write(&req_path, out.stdout).map_err(|e| e.to_string())?;
+        Ok(format!("Exported to {}", req_path.to_string_lossy()))
+    } else { Err(String::from_utf8_lossy(&out.stderr).to_string()) }
+}
+
+#[tauri::command]
+fn sync_requirements(venv_path: String) -> Result<String, String> {
+    let pip = get_pip_path(Path::new(&venv_path));
+    let pb = PathBuf::from(&venv_path);
+    let project_root = pb.parent().unwrap_or(Path::new(&venv_path));
+    let req_path = project_root.join("requirements.txt");
+    if !req_path.exists() { return Err("requirements.txt not found".into()); }
+    let out = Command::new(pip).args(["install", "-r", req_path.to_str().unwrap()]).output().map_err(|e| e.to_string())?;
+    if out.status.success() { Ok("Synced!".into()) } else { Err(String::from_utf8_lossy(&out.stderr).to_string()) }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let migrations = vec![
         Migration { version: 1, description: "init", sql: "CREATE TABLE workspaces (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE); CREATE TABLE venvs (id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_path TEXT, name TEXT, path TEXT UNIQUE, version TEXT, status TEXT, issue TEXT);", kind: MigrationKind::Up },
         Migration { version: 2, description: "last_mod", sql: "ALTER TABLE venvs ADD COLUMN last_modified INTEGER DEFAULT 0;", kind: MigrationKind::Up },
-        Migration { version: 3, description: "scripts", sql: "CREATE TABLE scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, venv_path TEXT, name TEXT, command TEXT);", kind: MigrationKind::Up }
+        Migration { version: 3, description: "scripts", sql: "CREATE TABLE scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, venv_path TEXT, name TEXT, command TEXT);", kind: MigrationKind::Up },
+        Migration { version: 4, description: "custom_templates", sql: "CREATE TABLE custom_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, packages TEXT);", kind: MigrationKind::Up }
     ];
     tauri::Builder::default()
         .plugin(tauri_plugin_sql::Builder::default().add_migrations("sqlite:py-manager.db", migrations).build())
@@ -237,7 +263,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
             open_terminal, open_in_vscode, create_venv, list_venvs, delete_venv, 
-            install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache
+            install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,
+            export_requirements, sync_requirements, get_pyvenv_cfg
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
