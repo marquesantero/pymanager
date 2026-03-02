@@ -32,3 +32,4 @@ tokio = { version = "1.0.0", features = ["full"] }
 walkdir = "2.5.0"
 tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-fs = "2"
+dirs = "6.0"

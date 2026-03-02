@@ -5,6 +5,7 @@ export interface VenvInfo {
   status: string;
   issue?: string;
   last_modified: number;
+  manager_type: "pip" | "uv";
 }
 
 export interface VenvDetails {

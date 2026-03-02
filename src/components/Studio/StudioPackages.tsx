@@ -2,6 +2,7 @@ import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Package, HardDrive, Layers, Upload, ArrowUpCircle, Trash2, Loader2 } from "lucide-react";
 import { VenvInfo, VenvDetails } from "../../types";
+import { packageService } from "../../services/packageManager";
 
 interface StudioPackagesProps {
   venv: VenvInfo;
@@ -33,7 +34,7 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details, r
     try {
       const confirmed = await window.confirm(`Uninstall ${pkgName}?`);
       if (confirmed) {
-        await invoke("uninstall_package", { venvPath: venv.path, package: pkgName });
+        await packageService.uninstall(venv, pkgName);
         setMessage(`Uninstalled ${pkgName}`);
         refresh();
       }
@@ -67,7 +68,7 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details, r
           <div className="flex items-center gap-4">
             {loadingSizes && <span className="flex items-center gap-2 text-[10px] font-bold text-blue-500 animate-pulse"><Loader2 size={12} className="animate-spin"/> Analyzing Sizes</span>}
             <button 
-              onClick={async () => { try { setMessage(await invoke("export_requirements", { venvPath: venv.path })); } catch (e) { setMessage(`Error: ${e}`); } }} 
+              onClick={async () => { try { setMessage(await packageService.exportRequirements(venv.path)); } catch (e) { setMessage(`Error: ${e}`); } }} 
               className="text-xs font-bold text-blue-600 hover:underline flex items-center gap-2"
             >
               <Upload size={14}/> Export requirements.txt
@@ -91,8 +92,18 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details, r
                   <span className="text-[10px] font-mono text-slate-400">{version}</span>
                 </div>
                 <div className="flex gap-1">
-                  <button onClick={() => invoke("update_package", { venvPath: venv.path, package: name }).then(() => refresh())} className="p-2 text-slate-400 hover:text-green-600 transition-colors"><ArrowUpCircle size={16}/></button>
-                  <button onClick={() => uninstallPkg(name)} className="p-2 text-slate-400 hover:text-red-500 transition-colors"><Trash2 size={16}/></button>
+                  <button 
+                    onClick={() => packageService.update(venv, name).then(() => refresh())} 
+                    className="p-2 text-slate-400 hover:text-green-600 transition-colors"
+                  >
+                    <ArrowUpCircle size={16}/>
+                  </button>
+                  <button 
+                    onClick={() => uninstallPkg(name)} 
+                    className="p-2 text-slate-400 hover:text-red-500 transition-colors"
+                  >
+                    <Trash2 size={16}/>
+                  </button>
                 </div>
               </div>
             );

@@ -4579,6 +4579,7 @@ dependencies = [
 name = "tauri-app"
 version = "0.1.0"
 dependencies = [
+ "dirs 6.0.0",
  "fs_extra",
  "reqwest",
  "serde",

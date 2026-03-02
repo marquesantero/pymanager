@@ -15,6 +15,7 @@ pub struct VenvInfo {
     status: String,
     issue: Option<String>,
     last_modified: u64,
+    manager_type: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -67,7 +68,21 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
                 _ => { status = "Broken".to_string(); issue = Some("Interpreter corrupted".to_string()); }
             }
         }
-        return Some(VenvInfo { name: p.file_name().unwrap_or_default().to_string_lossy().to_string(), path: p.to_string_lossy().to_string(), version, status, issue, last_modified });
+        let manager_type = if p.join("uv.lock").exists() || p.parent().map_or(false, |parent| parent.join("uv.lock").exists()) {
+            "uv".to_string()
+        } else {
+            "pip".to_string()
+        };
+
+        return Some(VenvInfo { 
+            name: p.file_name().unwrap_or_default().to_string_lossy().to_string(), 
+            path: p.to_string_lossy().to_string(), 
+            version, 
+            status, 
+            issue, 
+            last_modified,
+            manager_type
+        });
     }
     None
 }
@@ -305,13 +320,141 @@ fn list_venvs(base_path: String) -> Result<Vec<VenvInfo>, String> {
     Ok(venvs)
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct AuditReport {
+    broken_links: Vec<String>, // Paths in DB but not on disk
+    untracked_venvs: Vec<VenvInfo>, // Paths on disk but not in DB
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ManagerStatus {
+    uv: bool,
+    poetry: bool,
+    pdm: bool,
+}
+
 #[tauri::command]
-fn create_venv(path: String, name: String, python_bin: String) -> Result<String, String> {
+fn audit_environments(workspace_paths: Vec<String>, registered_paths: Vec<String>) -> AuditReport {
+    let mut broken_links = Vec::new();
+    let mut untracked_venvs = Vec::new();
+
+    // 1. Check for Broken Links (DB entries without physical folder)
+    for path in &registered_paths {
+        if !Path::new(path).exists() {
+            broken_links.push(path.clone());
+        }
+    }
+
+    // 2. Check for Untracked Venvs (Folders on disk not in DB)
+    for ws in workspace_paths {
+        let root = Path::new(&ws);
+        if !root.is_dir() { continue; }
+        
+        let walker = WalkDir::new(root).max_depth(3).into_iter().filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            !["node_modules", "target", "__pycache__", ".git"].contains(&name.as_ref())
+        });
+
+        for entry in walker.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if let Some(info) = get_venv_info(p) {
+                if !registered_paths.contains(&info.path) {
+                    untracked_venvs.push(info);
+                }
+            }
+        }
+    }
+
+    AuditReport { broken_links, untracked_venvs }
+}
+
+#[tauri::command]
+fn check_managers() -> ManagerStatus {
+    let mut uv = false;
+    let mut poetry = false;
+    let mut pdm = false;
+
+    // 1. First, check standard PATH
+    if Command::new("uv").arg("--version").output().is_ok() { uv = true; }
+    if Command::new("poetry").arg("--version").output().is_ok() { poetry = true; }
+    if Command::new("pdm").arg("--version").output().is_ok() { pdm = true; }
+
+    // 2. Comprehensive search in common directories
+    if !uv || !poetry || !pdm {
+        let mut search_dirs = vec![
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ];
+
+        if let Some(home) = dirs::home_dir() {
+            search_dirs.push(home.join(".local").join("bin"));
+            search_dirs.push(home.join(".cargo").join("bin"));
+            search_dirs.push(home.join("bin"));
+            search_dirs.push(home.join(".local").join("share").join("uv").join("bin")); // specific uv path
+        }
+
+        for dir in search_dirs {
+            if !uv && dir.join("uv").exists() { 
+                if Command::new(dir.join("uv")).arg("--version").output().is_ok() { uv = true; }
+            }
+            if !poetry && dir.join("poetry").exists() {
+                if Command::new(dir.join("poetry")).arg("--version").output().is_ok() { poetry = true; }
+            }
+            if !pdm && dir.join("pdm").exists() {
+                if Command::new(dir.join("pdm")).arg("--version").output().is_ok() { pdm = true; }
+            }
+        }
+    }
+
+    println!("EXHAUSTIVE CHECK: uv:{}, poetry:{}, pdm:{}", uv, poetry, pdm);
+    ManagerStatus { uv, poetry, pdm }
+}
+
+fn get_manager_path(cmd: &str) -> String {
+    // Check global PATH
+    if Command::new(cmd).arg("--version").output().is_ok() {
+        return cmd.to_string();
+    }
+
+    // Search manually
+    if let Some(home) = dirs::home_dir() {
+        let paths = [
+            home.join(".local").join("bin").join(cmd),
+            home.join(".cargo").join("bin").join(cmd),
+            home.join("bin").join(cmd),
+            PathBuf::from("/usr/local/bin").join(cmd),
+        ];
+        for p in paths {
+            if p.exists() && Command::new(&p).arg("--version").output().is_ok() {
+                return p.to_string_lossy().to_string();
+            }
+        }
+    }
+    cmd.to_string()
+}
+
+#[tauri::command]
+fn create_venv(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
     let mut full_path = PathBuf::from(&path);
     full_path.push(&name);
+    let target_path = full_path.to_str().unwrap();
+
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let mut cmd = Command::new(uv_path);
+        cmd.args(["venv", target_path]);
+        if !python_bin.is_empty() { cmd.arg("--python").arg(&python_bin); }
+        let output = cmd.output().map_err(|e| e.to_string())?;
+        if output.status.success() { return Ok(format!("Created with uv: {}", name)); }
+        else { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
+    }
+    // ...
+
     let bin = if python_bin.is_empty() { "python3".to_string() } else { python_bin };
-    let output = Command::new(bin).args(["-m", "venv", full_path.to_str().unwrap()]).output().map_err(|e| e.to_string())?;
-    if output.status.success() { Ok(format!("Created {}", name)) } else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+    let output = Command::new(bin).args(["-m", "venv", target_path]).output().map_err(|e| e.to_string())?;
+    if output.status.success() { Ok(format!("Created with venv: {}", name)) } 
+    else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
 }
 
 #[tauri::command]
@@ -321,21 +464,51 @@ fn delete_venv(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-fn install_dependency(venv_path: String, package: String) -> Result<String, String> {
+fn install_dependency(venv_path: String, package: String, engine: String) -> Result<String, String> {
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let python_path = get_python_path(Path::new(&venv_path));
+        let output = Command::new(uv_path)
+            .args(["pip", "install", "--python", python_path.to_str().unwrap(), &package])
+            .output().map_err(|e| e.to_string())?;
+        if output.status.success() { return Ok(format!("uv installed {}", package)); }
+        else { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
+    }
+
     let p = get_pip_path(Path::new(&venv_path));
     let output = Command::new(p).args(["install", &package]).output().map_err(|e| e.to_string())?;
     if output.status.success() { Ok(format!("Installed {}", package)) } else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
 }
 
 #[tauri::command]
-fn uninstall_package(venv_path: String, package: String) -> Result<String, String> {
+fn uninstall_package(venv_path: String, package: String, engine: String) -> Result<String, String> {
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let python_path = get_python_path(Path::new(&venv_path));
+        let out = Command::new(uv_path)
+            .args(["pip", "uninstall", "--python", python_path.to_str().unwrap(), "-y", &package])
+            .output().map_err(|e| e.to_string())?;
+        if out.status.success() { return Ok(format!("uv uninstalled {}", package)); }
+        else { return Err(String::from_utf8_lossy(&out.stderr).to_string()); }
+    }
+
     let pip = get_pip_path(Path::new(&venv_path));
     let out = Command::new(pip).args(["uninstall", "-y", &package]).output().map_err(|e| e.to_string())?;
     if out.status.success() { Ok(format!("Uninstalled {}", package)) } else { Err(String::from_utf8_lossy(&out.stderr).to_string()) }
 }
 
 #[tauri::command]
-fn update_package(venv_path: String, package: String) -> Result<String, String> {
+fn update_package(venv_path: String, package: String, engine: String) -> Result<String, String> {
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let python_path = get_python_path(Path::new(&venv_path));
+        let out = Command::new(uv_path)
+            .args(["pip", "install", "--upgrade", "--python", python_path.to_str().unwrap(), &package])
+            .output().map_err(|e| e.to_string())?;
+        if out.status.success() { return Ok(format!("uv updated {}", package)); }
+        else { return Err(String::from_utf8_lossy(&out.stderr).to_string()); }
+    }
+
     let pip = get_pip_path(Path::new(&venv_path));
     let out = Command::new(pip).args(["install", "--upgrade", &package]).output().map_err(|e| e.to_string())?;
     if out.status.success() { Ok(format!("Updated {}", package)) } else { Err(String::from_utf8_lossy(&out.stderr).to_string()) }
@@ -386,7 +559,9 @@ pub fn run() {
         Migration { version: 1, description: "init", sql: "CREATE TABLE workspaces (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT UNIQUE); CREATE TABLE venvs (id INTEGER PRIMARY KEY AUTOINCREMENT, workspace_path TEXT, name TEXT, path TEXT UNIQUE, version TEXT, status TEXT, issue TEXT);", kind: MigrationKind::Up },
         Migration { version: 2, description: "last_mod", sql: "ALTER TABLE venvs ADD COLUMN last_modified INTEGER DEFAULT 0;", kind: MigrationKind::Up },
         Migration { version: 3, description: "scripts", sql: "CREATE TABLE scripts (id INTEGER PRIMARY KEY AUTOINCREMENT, venv_path TEXT, name TEXT, command TEXT);", kind: MigrationKind::Up },
-        Migration { version: 4, description: "custom_templates", sql: "CREATE TABLE custom_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, packages TEXT);", kind: MigrationKind::Up }
+        Migration { version: 4, description: "custom_templates", sql: "CREATE TABLE custom_templates (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, packages TEXT);", kind: MigrationKind::Up },
+        Migration { version: 5, description: "orchestrator_fields", sql: "ALTER TABLE venvs ADD COLUMN manager_type TEXT DEFAULT 'pip'; ALTER TABLE venvs ADD COLUMN pyproject_path TEXT;", kind: MigrationKind::Up },
+        Migration { version: 6, description: "default_workspace", sql: "ALTER TABLE workspaces ADD COLUMN is_default INTEGER DEFAULT 0;", kind: MigrationKind::Up }
     ];
     tauri::Builder::default()
         .plugin(tauri_plugin_sql::Builder::default().add_migrations("sqlite:py-manager.db", migrations).build())
@@ -394,7 +569,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            get_package_sizes, generate_docker_files,
+            get_package_sizes, generate_docker_files, check_managers, audit_environments,
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
             open_terminal, open_in_vscode, create_venv, list_venvs, delete_venv, 
             install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,
