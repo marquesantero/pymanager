@@ -75,7 +75,7 @@ class DatabaseService {
     await db.execute("DELETE FROM venvs WHERE workspace_path = ?", [workspacePath]);
     for (const v of venvs) {
       await db.execute(
-        "INSERT OR IGNORE INTO venvs (workspace_path, name, path, version, status, issue, last_modified, manager_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO venvs (workspace_path, name, path, version, status, issue, last_modified, manager_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [workspacePath, v.name, v.path, v.version, v.status, v.issue || null, v.last_modified, v.manager_type]
       );
     }

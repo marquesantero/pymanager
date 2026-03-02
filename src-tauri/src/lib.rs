@@ -334,6 +334,34 @@ pub struct ManagerStatus {
 }
 
 #[tauri::command]
+fn get_dependency_tree(venv_path: String, engine: String) -> Result<serde_json::Value, String> {
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let python_path = get_python_path(Path::new(&venv_path));
+        let out = Command::new(uv_path)
+            .args(["tree", "--format", "json", "--python", python_path.to_str().unwrap()])
+            .output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+        } else {
+            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+        }
+    }
+
+    // For PIP, we use pipdeptree. It needs to be installed in the venv.
+    let python_path = get_python_path(Path::new(&venv_path));
+    let out = Command::new(python_path)
+        .args(["-m", "pipdeptree", "--json-tree"])
+        .output().map_err(|e| e.to_string())?;
+
+    if out.status.success() {
+        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+    } else {
+        Err("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string())
+    }
+}
+
+#[tauri::command]
 fn audit_environments(workspace_paths: Vec<String>, registered_paths: Vec<String>) -> AuditReport {
     let mut broken_links = Vec::new();
     let mut untracked_venvs = Vec::new();
@@ -569,7 +597,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            get_package_sizes, generate_docker_files, check_managers, audit_environments,
+            get_package_sizes, generate_docker_files, check_managers, audit_environments, get_dependency_tree,
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
             open_terminal, open_in_vscode, create_venv, list_venvs, delete_venv, 
             install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,

@@ -36,6 +36,16 @@ class PackageManagerService {
   }
 
   /**
+   * Obtém a árvore de dependências do ambiente
+   */
+  async getDependencyTree(venv: VenvInfo): Promise<any> {
+    return await invoke("get_dependency_tree", { 
+      venvPath: venv.path, 
+      engine: venv.manager_type 
+    });
+  }
+
+  /**
    * Exporta os requisitos (sempre gera requirements.txt para compatibilidade)
    */
   async exportRequirements(venvPath: string): Promise<string> {

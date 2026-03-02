@@ -115,13 +115,16 @@ export default function App() {
   };
 
   const openStudio = async (v: VenvInfo) => {
-    setSelectedVenv(v); setLoading(true); setStudioTab("packages");
+    setSelectedVenv(v);
+    setStudioTab("packages");
+    setVenvDetails(null); // Reset details to trigger loading state in subcomponents
+    
+    // Load secondary data in background without blocking UI opening
     try {
-      setVenvDetails(await invoke("get_venv_details", { path: v.path }));
-      setScripts(await dbService.getScripts(v.path));
-      setEnvContent(await invoke("read_env_file", { venvPath: v.path }));
-      setPyvenvCfg(await invoke("get_pyvenv_cfg", { venvPath: v.path }));
-    } catch (e) { console.error(e); } finally { setLoading(false); }
+      dbService.getScripts(v.path).then(setScripts);
+      invoke("read_env_file", { venvPath: v.path }).then((env: any) => setEnvContent(env));
+      invoke("get_pyvenv_cfg", { venvPath: v.path }).then((cfg: any) => setPyvenvCfg(cfg));
+    } catch (e) { console.error("BG Load Error:", e); }
   };
 
   const filteredVenvs = (venvCache[activeWorkspace] || []).filter(v => 
