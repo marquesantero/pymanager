@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ask } from "@tauri-apps/plugin-dialog";
 import { Terminal, RefreshCcw, Box, Loader2, Package, X, Code2, BookmarkPlus, Globe, Settings, ExternalLink, Trash2 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -14,7 +13,9 @@ import {
   useGlobalSearchShortcut,
   useStudioLoader,
   useThemeAndZoom,
+  useSaveTemplate,
   useVenvCreation,
+  useVenvDeletion,
   useWorkspaceCrudActions,
   useWorkspaceOperations
 } from "./hooks/useAppController";
@@ -96,6 +97,18 @@ export default function App() {
     setNewVenvName,
     setMessage,
     scanWorkspace
+  });
+  const handleDeleteVenv = useVenvDeletion({
+    activeWorkspace,
+    scanWorkspace,
+    setMessage
+  });
+  const handleSaveTemplate = useSaveTemplate({
+    selectedVenv,
+    venvDetails,
+    setVenvDetails,
+    setCustomTemplates,
+    setMessage
   });
   const openStudio = useStudioLoader({
     mountedRef,
@@ -205,7 +218,7 @@ export default function App() {
                   <button onClick={() => invoke("open_in_vscode", { path: v.path })} className="p-1.5 text-slate-400 hover:text-blue-600 transition-colors border border-transparent hover:border-slate-200 dark:hover:border-slate-700 rounded-md" title="VS Code"><Code2 size={14} /></button>
                   <button onClick={() => invoke("open_terminal", { path: v.path })} className="p-1.5 text-slate-400 hover:text-blue-600 transition-colors border border-transparent hover:border-slate-200 dark:hover:border-slate-700 rounded-md" title="Terminal"><ExternalLink size={14} /></button>
                   <button onClick={() => openStudio(v)} className="p-1.5 text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors border border-transparent hover:border-slate-200 dark:hover:border-slate-700 rounded-md" title="Studio"><Settings size={14} /></button>
-                  <button onClick={async () => { if (await ask("Delete environment folder?")) { await invoke("delete_venv", { path: v.path }); scanWorkspace(activeWorkspace); } }} className="p-1.5 text-slate-400 hover:text-red-500 transition-colors border border-transparent hover:border-red-100 rounded-md" title="Delete"><Trash2 size={14} /></button>
+                  <button onClick={() => handleDeleteVenv(v.path)} className="p-1.5 text-slate-400 hover:text-red-500 transition-colors border border-transparent hover:border-red-100 rounded-md" title="Delete"><Trash2 size={14} /></button>
                 </div>
               </div>
               <h4 className="font-bold text-xs truncate select-text">{v.name}</h4>
@@ -224,17 +237,7 @@ export default function App() {
               <div className="p-8 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-950/20 select-none">
                 <div className="flex items-center gap-6"><div className="p-4 bg-blue-600 text-white rounded-2xl shadow-lg"><Box size={32} /></div><div><h2 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">{selectedVenv.name}</h2><div className="flex items-center gap-2"><p className="text-xs font-mono text-slate-400">{selectedVenv.path}</p><span className="text-[9px] px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 rounded-md font-black uppercase tracking-widest">{selectedVenv.manager_type} Engine</span></div></div></div>
                 <div className="flex items-center gap-2">
-                  <button onClick={async () => {
-                    const n = prompt("Template name:");
-                    if (!n) return;
-                    try {
-                      const details = venvDetails || await invoke<VenvDetails>("get_venv_details", { path: selectedVenv.path });
-                      setVenvDetails(details);
-                      await dbService.saveCustomTemplate(n, details.packages.map(p => p.split("==")[0]));
-                      setCustomTemplates(await dbService.getCustomTemplates());
-                      setMessage(`Saved template: ${n}`);
-                    } catch (e) { setMessage(`Error: ${e}`); }
-                  }} className="flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-100 dark:border-blue-800 text-xs font-black uppercase hover:bg-blue-600 hover:text-white transition-all"><BookmarkPlus size={16} /> Save as Template</button>
+                  <button onClick={handleSaveTemplate} className="flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-100 dark:border-blue-800 text-xs font-black uppercase hover:bg-blue-600 hover:text-white transition-all"><BookmarkPlus size={16} /> Save as Template</button>
                   <button onClick={() => setSelectedVenv(null)} className="p-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl hover:bg-slate-100 dark:hover:bg-slate-700 transition-all shadow-sm"><X size={24} /></button>
                 </div>
               </div>

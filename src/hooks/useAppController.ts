@@ -311,6 +311,54 @@ interface StudioLoaderConfig {
   setPyvenvCfg: StateSetter<string>;
 }
 
+interface VenvDeletionConfig {
+  activeWorkspace: string;
+  scanWorkspace: (workspacePath: string) => Promise<void>;
+  setMessage: (msg: string) => void;
+}
+
+export function useVenvDeletion({ activeWorkspace, scanWorkspace, setMessage }: VenvDeletionConfig) {
+  return useCallback(async (venvPath: string) => {
+    if (!(await ask("Delete environment folder?"))) return;
+    try {
+      await invoke("delete_venv", { path: venvPath });
+      await scanWorkspace(activeWorkspace);
+    } catch (err) {
+      setMessage(`Error: ${err}`);
+    }
+  }, [activeWorkspace, scanWorkspace, setMessage]);
+}
+
+interface SaveTemplateConfig {
+  selectedVenv: VenvInfo | null;
+  venvDetails: VenvDetails | null;
+  setVenvDetails: StateSetter<VenvDetails | null>;
+  setCustomTemplates: StateSetter<Template[]>;
+  setMessage: (msg: string) => void;
+}
+
+export function useSaveTemplate({
+  selectedVenv,
+  venvDetails,
+  setVenvDetails,
+  setCustomTemplates,
+  setMessage
+}: SaveTemplateConfig) {
+  return useCallback(async () => {
+    const templateName = prompt("Template name:");
+    if (!templateName || !selectedVenv) return;
+    try {
+      const details = venvDetails || await invoke<VenvDetails>("get_venv_details", { path: selectedVenv.path });
+      setVenvDetails(details);
+      await dbService.saveCustomTemplate(templateName, details.packages.map((p) => p.split("==")[0]));
+      setCustomTemplates(await dbService.getCustomTemplates());
+      setMessage(`Saved template: ${templateName}`);
+    } catch (err) {
+      setMessage(`Error: ${err}`);
+    }
+  }, [selectedVenv, venvDetails, setVenvDetails, setCustomTemplates, setMessage]);
+}
+
 export function useStudioLoader({
   mountedRef,
   setSelectedVenv,
