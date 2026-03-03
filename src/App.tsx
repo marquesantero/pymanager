@@ -243,17 +243,13 @@ export default function App() {
           const s = await open({ directory: true });
           if (s) {
             const p = Array.isArray(s) ? s[0] : s;
-            let added = false;
-            setWorkspaces(prev => {
-              if (prev.some(w => w.path === p)) return prev;
-              added = true;
-              return [...prev, { path: p, is_default: false }];
-            });
-            if (added) {
-              await dbService.addWorkspace(p);
-              setActiveWorkspace(p);
-              scanWorkspace(p);
-            }
+            if (workspaces.some(w => w.path === p)) return;
+            await dbService.addWorkspace(p);
+            setWorkspaces(prev => (
+              prev.some(w => w.path === p) ? prev : [...prev, { path: p, is_default: false }]
+            ));
+            setActiveWorkspace(p);
+            scanWorkspace(p);
           }
         }}
         removeWorkspace={async (wsPath) => {
