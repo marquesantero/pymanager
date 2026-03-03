@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Trash2, Plus, X, AlertTriangle, Loader2, Sparkles } from "lucide-react";
 import { VenvInfo } from "../types";
@@ -7,7 +7,7 @@ import { dbService } from "../services/db";
 interface HygieneOverlayProps {
   onClose: () => void;
   workspaces: string[];
-  onRefresh: () => void;
+  onRefresh: () => Promise<void> | void;
   setMessage: (msg: string) => void;
 }
 
@@ -19,6 +19,11 @@ interface AuditReport {
 export const HygieneOverlay: React.FC<HygieneOverlayProps> = ({ onClose, workspaces, onRefresh, setMessage }) => {
   const [report, setReport] = useState<AuditReport>({ broken_links: [], untracked_venvs: [] });
   const [loading, setLoading] = useState(true);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const runAudit = async () => {
     setLoading(true);
@@ -29,17 +34,17 @@ export const HygieneOverlay: React.FC<HygieneOverlayProps> = ({ onClose, workspa
         workspacePaths: workspaces, 
         registeredPaths 
       });
-      setReport(res);
+      if (mountedRef.current) setReport(res);
     } catch (err) {
       console.error(err);
     } finally {
-      setLoading(false);
+      if (mountedRef.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     runAudit();
-  }, []);
+  }, [workspaces]);
 
   const prune = async (path: string) => {
     await dbService.removeVenvByPath(path);

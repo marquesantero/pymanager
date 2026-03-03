@@ -25,6 +25,18 @@ export interface Script {
   command: string;
 }
 
+export interface ManagerStatus {
+  uv: boolean;
+  poetry: boolean;
+  pdm: boolean;
+}
+
+export interface ToastMessage {
+  id: number;
+  text: string;
+  tone: "info" | "success" | "error";
+}
+
 export interface Template {
   id: string;
   name: string;

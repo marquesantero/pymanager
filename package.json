@@ -1,11 +1,14 @@
 {
-  "name": "tauri-app",
+  "name": "pymanager",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "check:frontend": "tsc --noEmit",
+    "check:rust": "cd src-tauri && cargo check",
+    "check": "npm run check:frontend && npm run check:rust",
     "preview": "vite preview",
     "tauri": "tauri"
   },

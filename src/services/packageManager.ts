@@ -38,7 +38,7 @@ class PackageManagerService {
   /**
    * Obtém a árvore de dependências do ambiente
    */
-  async getDependencyTree(venv: VenvInfo): Promise<any> {
+  async getDependencyTree(venv: VenvInfo): Promise<unknown> {
     return await invoke("get_dependency_tree", { 
       venvPath: venv.path, 
       engine: venv.manager_type 
@@ -48,7 +48,7 @@ class PackageManagerService {
   /**
    * Realiza auditoria de segurança (vulnerabilidades)
    */
-  async auditSecurity(venvPath: string): Promise<any> {
+  async auditSecurity(venvPath: string): Promise<unknown> {
     return await invoke("audit_security", { venvPath });
   }
 

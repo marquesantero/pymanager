@@ -1,14 +1,15 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 import { Terminal, RefreshCcw, Box, Loader2, Package, X, Code2, BookmarkPlus, Globe, Settings, ExternalLink, Trash2 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
-import { VenvInfo, VenvDetails, Script, ThemeMode, StatusFilter, StudioTabId, Template } from "./types";
+import { VenvInfo, VenvDetails, Script, ThemeMode, StatusFilter, StudioTabId, Template, ManagerStatus } from "./types";
 import { PYTHON_TEMPLATES } from "./constants/templates";
 import { STATUS_FILTERS, STUDIO_TABS } from "./constants/ui";
 import { dbService } from "./services/db";
+import { useToastMessages } from "./hooks/useToastMessages";
 
 import { Sidebar } from "./components/Sidebar";
 import { HygieneOverlay } from "./components/HygieneOverlay";
@@ -30,7 +31,6 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeMode>("system");
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("All");
-  const [message, setMessage] = useState("");
   const [zoomLevel, setZoomLevel] = useState(100);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
 
@@ -50,6 +50,9 @@ export default function App() {
   const [isHygieneOpen, setIsHygieneOpen] = useState(false);
   const [isSearchOpen, setIsSearchOpen] = useState(false);
 
+  const { statusText, toasts, pushMessage: setMessage, mountedRef } = useToastMessages();
+  const studioLoadIdRef = useRef(0);
+
   useEffect(() => {
     const handleGlobalKeys = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "k") {
@@ -62,29 +65,45 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
     const load = async () => {
       try {
-        const ws = await dbService.getWorkspaces(); setWorkspaces(ws);
+        const ws = await dbService.getWorkspaces();
+        if (cancelled) return;
+        setWorkspaces(ws);
+
         if (ws.length > 0) {
           const def = ws.find(w => w.is_default) || ws[0];
-          setActiveWorkspace(def.path);
+          if (!cancelled) setActiveWorkspace(def.path);
         }
-        setVenvCache(await dbService.getCachedVenvs());
-        const py: string[] = await invoke("list_system_pythons"); setSystemPythons(py);
-        if (py.length > 0) setSelectedPython(py[0].split('|')[0]);
-        setCustomTemplates(await dbService.getCustomTemplates());
-        
-        // VITAL: Await manager check and force update
-        const mgrs: any = await invoke("check_managers");
-        console.log("MANAGER AUDIT:", mgrs);
-        if (mgrs) {
+
+        const cache = await dbService.getCachedVenvs();
+        if (!cancelled) setVenvCache(cache);
+
+        const py = await invoke<string[]>("list_system_pythons");
+        if (!cancelled) {
+          setSystemPythons(py);
+          if (py.length > 0) setSelectedPython(py[0].split("|")[0]);
+        }
+
+        const templates = await dbService.getCustomTemplates();
+        if (!cancelled) setCustomTemplates(templates);
+
+        const mgrs = await invoke<ManagerStatus>("check_managers");
+        if (!cancelled && mgrs) {
           setAvailableManagers(mgrs);
           if (mgrs.uv) setSelectedEngine("uv");
         }
-      } catch (err) { console.error("BOOT ERR:", err); }
-      finally { setIsInitialLoading(false); }
+      } catch (err) {
+        console.error("BOOT ERR:", err);
+      } finally {
+        if (!cancelled) setIsInitialLoading(false);
+      }
     };
+
     load();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -96,22 +115,27 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    // We apply scaling to the root body or a wrapper to ensure everything (px and rem) scales
     const root = document.getElementById("root-container");
     if (root) {
       root.style.zoom = `${zoomLevel}%`;
-      // For browsers that don't support zoom (like some old WebKits), 
-      // we can use transform, but zoom is cleaner for layouts.
     }
   }, [zoomLevel]);
 
   const scanWorkspace = async (p: string) => {
-    if (!p) return; setLoading(true); setMessage(`Scanning...`);
+    if (!p) return;
+    setLoading(true);
+    setMessage("Scanning...");
+
     try {
       const res: VenvInfo[] = await invoke("list_venvs", { basePath: p });
-      await dbService.saveVenvCache(p, res); setVenvCache(prev => ({ ...prev, [p]: res }));
+      await dbService.saveVenvCache(p, res);
+      setVenvCache(prev => ({ ...prev, [p]: res }));
       setMessage(`${res.length} envs found.`);
-    } catch (e) { setMessage(`Error: ${e}`); } finally { setLoading(false); }
+    } catch (e) {
+      setMessage(`Error: ${e}`);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const syncSingleVenv = async (p: string) => {
@@ -124,37 +148,60 @@ export default function App() {
         if (!wsKey) return prev;
         return { ...prev, [wsKey]: prev[wsKey].map(v => v.path === p ? updated : v) };
       });
-    } catch (err) { console.error(err); } finally { setSyncingVenv(null); }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setSyncingVenv(null);
+    }
   };
 
   const openStudio = async (v: VenvInfo) => {
+    const loadId = studioLoadIdRef.current + 1;
+    studioLoadIdRef.current = loadId;
+
     setSelectedVenv(v);
     setStudioTab("packages");
-    setVenvDetails(null); // Reset details to trigger loading state in subcomponents
-    
-    // Load secondary data in background without blocking UI opening
+    setVenvDetails(null);
+
     try {
-      dbService.getScripts(v.path).then(setScripts);
-      invoke("read_env_file", { venvPath: v.path })
-        .then((env: any) => setEnvContent(env))
+      dbService.getScripts(v.path).then(items => {
+        if (!mountedRef.current || studioLoadIdRef.current !== loadId) return;
+        setScripts(items);
+      });
+
+      invoke<string>("read_env_file", { venvPath: v.path })
+        .then((env) => {
+          if (!mountedRef.current || studioLoadIdRef.current !== loadId) return;
+          setEnvContent(env);
+        })
         .catch((e) => console.error("Env load error:", e));
-      invoke("get_pyvenv_cfg", { venvPath: v.path })
-        .then((cfg: any) => setPyvenvCfg(cfg))
+
+      invoke<string>("get_pyvenv_cfg", { venvPath: v.path })
+        .then((cfg) => {
+          if (!mountedRef.current || studioLoadIdRef.current !== loadId) return;
+          setPyvenvCfg(cfg);
+        })
         .catch((e) => console.error("pyvenv.cfg load error:", e));
-      invoke("get_venv_details", { path: v.path })
-        .then((details: any) => setVenvDetails(details))
+
+      invoke<VenvDetails>("get_venv_details", { path: v.path })
+        .then((details) => {
+          if (!mountedRef.current || studioLoadIdRef.current !== loadId) return;
+          setVenvDetails(details);
+        })
         .catch((e) => console.error("Venv details load error:", e));
-    } catch (e) { console.error("BG Load Error:", e); }
+    } catch (e) {
+      console.error("BG Load Error:", e);
+    }
   };
 
-  const filteredVenvs = (venvCache[activeWorkspace] || []).filter(v => 
+  const filteredVenvs = (venvCache[activeWorkspace] || []).filter(v =>
     v.name.toLowerCase().includes(searchQuery.toLowerCase()) && (statusFilter === "All" || v.status === statusFilter)
   );
 
-  const stats = { 
-    total: (venvCache[activeWorkspace] || []).length, 
-    healthy: (venvCache[activeWorkspace] || []).filter(v => v.status === "Healthy").length, 
-    broken: (venvCache[activeWorkspace] || []).filter(v => v.status === "Broken").length 
+  const stats = {
+    total: (venvCache[activeWorkspace] || []).length,
+    healthy: (venvCache[activeWorkspace] || []).filter(v => v.status === "Healthy").length,
+    broken: (venvCache[activeWorkspace] || []).filter(v => v.status === "Broken").length
   };
 
   if (isInitialLoading) {
@@ -188,24 +235,37 @@ export default function App() {
 
   return (
     <div id="root-container" className="flex h-screen bg-slate-100 dark:bg-slate-950 text-slate-800 dark:text-slate-50 font-sans overflow-hidden transition-colors duration-200 origin-top-left">
-
-      <Sidebar 
-        theme={theme} setTheme={setTheme} workspaces={workspaces} activeWorkspace={activeWorkspace} 
+      <Sidebar
+        theme={theme} setTheme={setTheme} workspaces={workspaces} activeWorkspace={activeWorkspace}
         setActiveWorkspace={setActiveWorkspace} scanWorkspace={scanWorkspace}
         openHygiene={() => setIsHygieneOpen(true)}
         addWorkspace={async () => {
           const s = await open({ directory: true });
           if (s) {
             const p = Array.isArray(s) ? s[0] : s;
-            if (!workspaces.some(w => w.path === p)) { await dbService.addWorkspace(p); setWorkspaces([...workspaces, { path: p, is_default: false }]); setActiveWorkspace(p); scanWorkspace(p); }
+            let added = false;
+            setWorkspaces(prev => {
+              if (prev.some(w => w.path === p)) return prev;
+              added = true;
+              return [...prev, { path: p, is_default: false }];
+            });
+            if (added) {
+              await dbService.addWorkspace(p);
+              setActiveWorkspace(p);
+              scanWorkspace(p);
+            }
           }
         }}
         removeWorkspace={async (wsPath) => {
-          if (await ask(`Remove ${wsPath}?`)) { await dbService.removeWorkspace(wsPath); setWorkspaces(workspaces.filter(w => w.path !== wsPath)); if (activeWorkspace === wsPath) setActiveWorkspace(""); }
+          if (await ask(`Remove ${wsPath}?`)) {
+            await dbService.removeWorkspace(wsPath);
+            setWorkspaces(prev => prev.filter(w => w.path !== wsPath));
+            setActiveWorkspace(prev => prev === wsPath ? "" : prev);
+          }
         }}
         setDefaultWorkspace={async (wsPath) => {
           await dbService.setDefaultWorkspace(wsPath);
-          setWorkspaces(workspaces.map(w => ({ ...w, is_default: w.path === wsPath })));
+          setWorkspaces(prev => prev.map(w => ({ ...w, is_default: w.path === wsPath })));
           setMessage("Default workspace updated.");
         }}
       />
@@ -229,30 +289,38 @@ export default function App() {
         </header>
 
         <div className="px-8 py-3 bg-white dark:bg-slate-900/30 border-b border-slate-200 dark:border-slate-800 flex flex-col gap-2 shrink-0 select-none font-bold">
-            <div className="flex items-center gap-3">
-                <p className="text-[9px] font-black uppercase text-slate-400">New Env</p>
-                <input value={newVenvName} onChange={(e) => setNewVenvName(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-3 py-1 text-xs w-64 outline-none focus:border-blue-500" placeholder="Name..." />
-                
-                <div className="flex bg-slate-100 dark:bg-slate-950 p-0.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-inner">
-                    <button onClick={() => setSelectedEngine("pip")} className={cn("px-2 py-0.5 rounded-md text-[9px] font-black transition-all", selectedEngine === "pip" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}>PIP</button>
-                    {availableManagers.uv && (
-                        <button onClick={() => setSelectedEngine("uv")} className={cn("px-2 py-0.5 rounded-md text-[9px] font-black transition-all", selectedEngine === "uv" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}>UV</button>
-                    )}
-                </div>
+          <div className="flex items-center gap-3">
+            <p className="text-[9px] font-black uppercase text-slate-400">New Env</p>
+            <input value={newVenvName} onChange={(e) => setNewVenvName(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-3 py-1 text-xs w-64 outline-none focus:border-blue-500" placeholder="Name..." />
 
-                <select value={selectedPython} onChange={(e) => setSelectedPython(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs text-blue-600">{systemPythons.map(p => <option key={p.split('|')[0]} value={p.split('|')[0]}>{p.split('|')[1]}</option>)}</select>
-                <select value={selectedTemplate.id} onChange={(e) => setSelectedTemplate([...PYTHON_TEMPLATES, ...customTemplates].find(t => t.id === e.target.value) || PYTHON_TEMPLATES[0])} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs">{[...PYTHON_TEMPLATES, ...customTemplates].map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
-                <button onClick={async () => {
-                  if (!newVenvName || !activeWorkspace) return; setLoading(true);
-                  try {
-                    await invoke("create_venv", { path: activeWorkspace, name: newVenvName, pythonBin: selectedPython, engine: selectedEngine });
-                    for (const pkg of selectedTemplate.pkgs) { await invoke("install_dependency", { venvPath: `${activeWorkspace}/${newVenvName}`, package: pkg, engine: selectedEngine }); }
-                    setNewVenvName(""); scanWorkspace(activeWorkspace);
-                  } catch (e) { setMessage(`Error: ${e}`); } finally { setLoading(false); }
-                }} disabled={loading || !newVenvName} className="bg-blue-600 text-white px-4 py-1 rounded-md text-[10px] font-black uppercase shadow-sm active:scale-95 transition-all">{loading ? <Loader2 size={10} className="animate-spin"/> : "Build"}</button>
-                {message && <p className="text-[9px] font-black text-blue-500 truncate ml-auto uppercase">{message}</p>}
+            <div className="flex bg-slate-100 dark:bg-slate-950 p-0.5 rounded-lg border border-slate-200 dark:border-slate-800 shadow-inner">
+              <button onClick={() => setSelectedEngine("pip")} className={cn("px-2 py-0.5 rounded-md text-[9px] font-black transition-all", selectedEngine === "pip" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}>PIP</button>
+              {availableManagers.uv && (
+                <button onClick={() => setSelectedEngine("uv")} className={cn("px-2 py-0.5 rounded-md text-[9px] font-black transition-all", selectedEngine === "uv" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}>UV</button>
+              )}
             </div>
-            {selectedPython && <p className="text-[9px] text-slate-400 font-mono ml-[52px] truncate opacity-70">Binary: {selectedPython}</p>}
+
+            <select value={selectedPython} onChange={(e) => setSelectedPython(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs text-blue-600">{systemPythons.map(p => <option key={p.split('|')[0]} value={p.split('|')[0]}>{p.split('|')[1]}</option>)}</select>
+            <select value={selectedTemplate.id} onChange={(e) => setSelectedTemplate([...PYTHON_TEMPLATES, ...customTemplates].find(t => t.id === e.target.value) || PYTHON_TEMPLATES[0])} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs">{[...PYTHON_TEMPLATES, ...customTemplates].map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
+            <button onClick={async () => {
+              if (!newVenvName || !activeWorkspace) return;
+              setLoading(true);
+              try {
+                await invoke("create_venv", { path: activeWorkspace, name: newVenvName, pythonBin: selectedPython, engine: selectedEngine });
+                for (const pkg of selectedTemplate.pkgs) {
+                  await invoke("install_dependency", { venvPath: `${activeWorkspace}/${newVenvName}`, package: pkg, engine: selectedEngine });
+                }
+                setNewVenvName("");
+                scanWorkspace(activeWorkspace);
+              } catch (e) {
+                setMessage(`Error: ${e}`);
+              } finally {
+                setLoading(false);
+              }
+            }} disabled={loading || !newVenvName} className="bg-blue-600 text-white px-4 py-1 rounded-md text-[10px] font-black uppercase shadow-sm active:scale-95 transition-all">{loading ? <Loader2 size={10} className="animate-spin" /> : "Build"}</button>
+            {statusText && <p className="text-[9px] font-black text-blue-500 truncate ml-auto uppercase">{statusText}</p>}
+          </div>
+          {selectedPython && <p className="text-[9px] text-slate-400 font-mono ml-[52px] truncate opacity-70">Binary: {selectedPython}</p>}
         </div>
 
         <div className="flex-1 overflow-y-auto p-8 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4 items-start pb-20">
@@ -265,7 +333,7 @@ export default function App() {
                   <button onClick={() => invoke("open_in_vscode", { path: v.path })} className="p-1.5 text-slate-400 hover:text-blue-600 transition-colors border border-transparent hover:border-slate-200 dark:hover:border-slate-700 rounded-md" title="VS Code"><Code2 size={14} /></button>
                   <button onClick={() => invoke("open_terminal", { path: v.path })} className="p-1.5 text-slate-400 hover:text-blue-600 transition-colors border border-transparent hover:border-slate-200 dark:hover:border-slate-700 rounded-md" title="Terminal"><ExternalLink size={14} /></button>
                   <button onClick={() => openStudio(v)} className="p-1.5 text-slate-400 hover:text-slate-900 dark:hover:text-white transition-colors border border-transparent hover:border-slate-200 dark:hover:border-slate-700 rounded-md" title="Studio"><Settings size={14} /></button>
-                  <button onClick={async () => { if (await ask(`Delete environment folder?`)) { await invoke("delete_venv", { path: v.path }); scanWorkspace(activeWorkspace); } }} className="p-1.5 text-slate-400 hover:text-red-500 transition-colors border border-transparent hover:border-red-100 rounded-md" title="Delete"><Trash2 size={14} /></button>
+                  <button onClick={async () => { if (await ask("Delete environment folder?")) { await invoke("delete_venv", { path: v.path }); scanWorkspace(activeWorkspace); } }} className="p-1.5 text-slate-400 hover:text-red-500 transition-colors border border-transparent hover:border-red-100 rounded-md" title="Delete"><Trash2 size={14} /></button>
                 </div>
               </div>
               <h4 className="font-bold text-xs truncate select-text">{v.name}</h4>
@@ -282,26 +350,26 @@ export default function App() {
           <div className="fixed inset-0 bg-slate-950/60 backdrop-blur-md z-50 flex items-center justify-center p-12 transition-all">
             <div className="bg-white dark:bg-slate-900 w-full h-full rounded-[2rem] border border-slate-200 dark:border-slate-800 shadow-2xl flex flex-col overflow-hidden animate-in zoom-in-95 duration-200">
               <div className="p-8 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between bg-slate-50 dark:bg-slate-950/20 select-none">
-                <div className="flex items-center gap-6"><div className="p-4 bg-blue-600 text-white rounded-2xl shadow-lg"><Box size={32}/></div><div><h2 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">{selectedVenv.name}</h2><div className="flex items-center gap-2"><p className="text-xs font-mono text-slate-400">{selectedVenv.path}</p><span className="text-[9px] px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 rounded-md font-black uppercase tracking-widest">{selectedVenv.manager_type} Engine</span></div></div></div>
+                <div className="flex items-center gap-6"><div className="p-4 bg-blue-600 text-white rounded-2xl shadow-lg"><Box size={32} /></div><div><h2 className="text-2xl font-black text-slate-900 dark:text-white tracking-tight">{selectedVenv.name}</h2><div className="flex items-center gap-2"><p className="text-xs font-mono text-slate-400">{selectedVenv.path}</p><span className="text-[9px] px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/40 text-blue-600 dark:text-blue-400 rounded-md font-black uppercase tracking-widest">{selectedVenv.manager_type} Engine</span></div></div></div>
                 <div className="flex items-center gap-2">
-                    <button onClick={async () => {
-                        const n = prompt("Template name:");
-                        if (!n) return;
-                        try {
-                          const details = venvDetails || await invoke<VenvDetails>("get_venv_details", { path: selectedVenv.path });
-                          setVenvDetails(details);
-                          await dbService.saveCustomTemplate(n, details.packages.map(p => p.split("==")[0]));
-                          setCustomTemplates(await dbService.getCustomTemplates());
-                          setMessage(`Saved template: ${n}`);
-                        } catch (e) { setMessage(`Error: ${e}`); }
-                    }} className="flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-100 dark:border-blue-800 text-xs font-black uppercase hover:bg-blue-600 hover:text-white transition-all"><BookmarkPlus size={16}/> Save as Template</button>
-                    <button onClick={() => setSelectedVenv(null)} className="p-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl hover:bg-slate-100 dark:hover:bg-slate-700 transition-all shadow-sm"><X size={24}/></button>
+                  <button onClick={async () => {
+                    const n = prompt("Template name:");
+                    if (!n) return;
+                    try {
+                      const details = venvDetails || await invoke<VenvDetails>("get_venv_details", { path: selectedVenv.path });
+                      setVenvDetails(details);
+                      await dbService.saveCustomTemplate(n, details.packages.map(p => p.split("==")[0]));
+                      setCustomTemplates(await dbService.getCustomTemplates());
+                      setMessage(`Saved template: ${n}`);
+                    } catch (e) { setMessage(`Error: ${e}`); }
+                  }} className="flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-100 dark:border-blue-800 text-xs font-black uppercase hover:bg-blue-600 hover:text-white transition-all"><BookmarkPlus size={16} /> Save as Template</button>
+                  <button onClick={() => setSelectedVenv(null)} className="p-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl hover:bg-slate-100 dark:hover:bg-slate-700 transition-all shadow-sm"><X size={24} /></button>
                 </div>
               </div>
               <div className="flex px-8 border-b border-slate-100 dark:border-slate-800 bg-white dark:bg-slate-900 select-none">
-                {[...STUDIO_TABS, { id: "deploy", label: "Deploy", icon: Globe }].map(tab => {
-                    const TabIcon = tab.icon;
-                    return <button key={tab.id} onClick={() => setStudioTab(tab.id as any)} className={cn("flex items-center gap-2 px-6 py-4 text-xs font-black uppercase tracking-widest border-b-2 transition-all", studioTab === tab.id ? "border-blue-600 text-blue-600 bg-blue-50/10" : "border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-200")}><TabIcon size={16}/> {tab.label}</button>
+                {[...STUDIO_TABS, { id: "deploy" as const, label: "Deploy", icon: Globe }].map(tab => {
+                  const TabIcon = tab.icon;
+                  return <button key={tab.id} onClick={() => setStudioTab(tab.id)} className={cn("flex items-center gap-2 px-6 py-4 text-xs font-black uppercase tracking-widest border-b-2 transition-all", studioTab === tab.id ? "border-blue-600 text-blue-600 bg-blue-50/10" : "border-transparent text-slate-400 hover:text-slate-600 dark:hover:text-slate-200")}><TabIcon size={16} /> {tab.label}</button>;
                 })}
               </div>
               <div className="flex-1 overflow-y-auto p-10 bg-slate-50 dark:bg-slate-950/10 scrollbar-thin">
@@ -317,7 +385,7 @@ export default function App() {
       </main>
 
       {isHygieneOpen && (
-        <HygieneOverlay 
+        <HygieneOverlay
           workspaces={workspaces.map(w => w.path)}
           onClose={() => setIsHygieneOpen(false)}
           onRefresh={async () => {
@@ -327,12 +395,30 @@ export default function App() {
         />
       )}
 
-      <CommandPalette 
+      <CommandPalette
         isOpen={isSearchOpen}
         onClose={() => setIsSearchOpen(false)}
         venvCache={venvCache}
         onSelectVenv={openStudio}
       />
+
+      <div className="fixed right-5 bottom-5 z-[120] flex flex-col gap-2 pointer-events-none">
+        {toasts.map(t => (
+          <div
+            key={t.id}
+            className={cn(
+              "min-w-[260px] max-w-[420px] text-[11px] font-bold px-4 py-3 rounded-xl border shadow-lg",
+              t.tone === "error"
+                ? "bg-red-50 border-red-200 text-red-700"
+                : t.tone === "success"
+                  ? "bg-green-50 border-green-200 text-green-700"
+                  : "bg-slate-50 border-slate-200 text-slate-700"
+            )}
+          >
+            {t.text}
+          </div>
+        ))}
       </div>
-      );
-      }
+    </div>
+  );
+}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Package, HardDrive, Layers, Upload, ArrowUpCircle, Trash2, Loader2, Share2, List, Network } from "lucide-react";
 import { VenvInfo, VenvDetails } from "../../types";
@@ -23,17 +23,22 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
   const [loading, setLoading] = useState(!initialDetails);
   const [loadingSizes, setLoadingSizes] = useState(false);
   const [viewMode, setViewMode] = useState<"list" | "tree" | "graph">("list");
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    return () => { mountedRef.current = false; };
+  }, []);
 
   useEffect(() => {
     const fetchDetails = async () => {
       setLoading(true);
       try {
         const d: VenvDetails = await invoke("get_venv_details", { path: venv.path });
-        setLocalDetails(d);
+        if (mountedRef.current) setLocalDetails(d);
       } catch (err) {
         console.error("Error fetching venv details:", err);
       } finally {
-        setLoading(false);
+        if (mountedRef.current) setLoading(false);
       }
     };
     fetchDetails();
@@ -45,11 +50,11 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
       setLoadingSizes(true);
       try {
         const sizes: Record<string, number> = await invoke("get_package_sizes", { venvPath: venv.path });
-        setPackageSizes(sizes);
+        if (mountedRef.current) setPackageSizes(sizes);
       } catch (err) { 
         console.error("Error fetching package sizes:", err); 
       } finally { 
-        setLoadingSizes(false); 
+        if (mountedRef.current) setLoadingSizes(false); 
       }
     };
     fetchSizes();

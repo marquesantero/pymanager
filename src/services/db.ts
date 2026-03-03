@@ -72,12 +72,19 @@ class DatabaseService {
 
   async saveVenvCache(workspacePath: string, venvs: VenvInfo[]) {
     const db = await this.init();
-    await db.execute("DELETE FROM venvs WHERE workspace_path = ?", [workspacePath]);
-    for (const v of venvs) {
-      await db.execute(
-        "INSERT OR REPLACE INTO venvs (workspace_path, name, path, version, status, issue, last_modified, manager_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        [workspacePath, v.name, v.path, v.version, v.status, v.issue || null, v.last_modified, v.manager_type]
-      );
+    await db.execute("BEGIN TRANSACTION");
+    try {
+      await db.execute("DELETE FROM venvs WHERE workspace_path = ?", [workspacePath]);
+      for (const v of venvs) {
+        await db.execute(
+          "INSERT OR REPLACE INTO venvs (workspace_path, name, path, version, status, issue, last_modified, manager_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          [workspacePath, v.name, v.path, v.version, v.status, v.issue || null, v.last_modified, v.manager_type]
+        );
+      }
+      await db.execute("COMMIT");
+    } catch (err) {
+      await db.execute("ROLLBACK");
+      throw err;
     }
   }
 
