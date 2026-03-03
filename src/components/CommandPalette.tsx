@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Search, Command, Terminal, Package, ArrowRight, X, MousePointer2 } from "lucide-react";
+import { Search, Command, Terminal, Package, ArrowRight } from "lucide-react";
 import { VenvInfo } from "../types";
 
 interface CommandPaletteProps {

@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ShieldCheck, Trash2, Plus, X, AlertTriangle, CheckCircle2, Loader2, Sparkles } from "lucide-react";
+import { Trash2, Plus, X, AlertTriangle, Loader2, Sparkles } from "lucide-react";
 import { VenvInfo } from "../types";
 import { dbService } from "../services/db";
 
@@ -43,8 +43,8 @@ export const HygieneOverlay: React.FC<HygieneOverlayProps> = ({ onClose, workspa
 
   const prune = async (path: string) => {
     await dbService.removeVenvByPath(path);
-    runAudit();
-    onRefresh();
+    await runAudit();
+    await onRefresh();
     setMessage("Dead link pruned from database.");
   };
 
@@ -57,8 +57,8 @@ export const HygieneOverlay: React.FC<HygieneOverlayProps> = ({ onClose, workspa
     const targetWs = matchingWorkspaces[0] || workspaces[0];
     
     await dbService.addSingleVenv(targetWs, venv);
-    runAudit();
-    onRefresh();
+    await runAudit();
+    await onRefresh();
     setMessage(`Adopted ${venv.name} into workspace: ${targetWs.split('/').pop()}`);
   };
 

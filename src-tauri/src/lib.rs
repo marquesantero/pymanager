@@ -64,7 +64,16 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
         } else {
             let version_output = Command::new(&bin_path).arg("--version").output();
             match version_output {
-                Ok(out) if out.status.success() => { version = String::from_utf8_lossy(&out.stdout).trim().to_string(); },
+                Ok(out) if out.status.success() => {
+                    let parsed = if out.stdout.is_empty() {
+                        String::from_utf8_lossy(&out.stderr).trim().to_string()
+                    } else {
+                        String::from_utf8_lossy(&out.stdout).trim().to_string()
+                    };
+                    if !parsed.is_empty() {
+                        version = parsed;
+                    }
+                },
                 _ => { status = "Broken".to_string(); issue = Some("Interpreter corrupted".to_string()); }
             }
         }
@@ -278,14 +287,27 @@ fn save_env_file(venv_path: String, content: String) -> Result<(), String> {
 fn open_terminal(path: String) -> Result<(), String> {
     #[cfg(target_os = "linux")] {
         let terminal_commands = [("gnome-terminal", vec!["--working-directory"]), ("konsole", vec!["--workdir"]), ("xfce4-terminal", vec!["--working-directory"]), ("xterm", vec!["-cd"])];
+        let mut started = false;
         for (term, args) in terminal_commands {
             let mut cmd = Command::new(term);
             for arg in &args { cmd.arg(arg); }
             cmd.arg(&path);
-            if cmd.spawn().is_ok() { return Ok(()); }
+            if cmd.spawn().is_ok() {
+                started = true;
+                break;
+            }
+        }
+        if !started {
+            return Err("No supported terminal emulator found on PATH".to_string());
         }
     }
     #[cfg(target_os = "windows")] { Command::new("cmd").args(["/c", "start", "cmd.exe", "/k", "cd", "/d", &path]).spawn().map_err(|e| e.to_string())?; }
+    #[cfg(target_os = "macos")] {
+        Command::new("open")
+            .args(["-a", "Terminal", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -308,7 +330,8 @@ fn list_venvs(base_path: String) -> Result<Vec<VenvInfo>, String> {
     let mut venvs = Vec::new();
     let root = Path::new(&base_path);
     if !root.is_dir() { return Err("Invalid directory path".to_string()); }
-    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
+    // Limit traversal depth to keep scanning responsive on very large monorepos.
+    let walker = WalkDir::new(root).max_depth(8).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         if name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" { return false; }
         if name.starts_with('.') && name != ".venv" { return false; }

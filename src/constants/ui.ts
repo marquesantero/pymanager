@@ -1,6 +1,5 @@
 import { ThemeMode, StatusFilter, StudioTabId } from "../types";
 import { Sun, Moon, Monitor, Package, Play, FileText, ShieldCheck } from "lucide-react";
-import React from "react";
 
 export const THEME_OPTIONS: { mode: ThemeMode; icon: any }[] = [
   { mode: "light", icon: Sun },

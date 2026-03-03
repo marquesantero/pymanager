@@ -1,5 +1,5 @@
 import React from "react";
-import { Package, Sun, Moon, Monitor, Plus, Folder, RefreshCcw, Trash2, Sparkles, Star } from "lucide-react";
+import { Package, Plus, Folder, RefreshCcw, Trash2, Sparkles, Star } from "lucide-react";
 import { THEME_OPTIONS } from "../constants/ui";
 import { ThemeMode } from "../types";
 
@@ -17,7 +17,7 @@ interface SidebarProps {
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({ 
-  theme, setTheme, workspaces, activeWorkspace, setActiveWorkspace, addWorkspace, scanWorkspace, removeWorkspace, openHygiene 
+  theme, setTheme, workspaces, activeWorkspace, setActiveWorkspace, addWorkspace, scanWorkspace, removeWorkspace, openHygiene, setDefaultWorkspace
 }) => {
   return (
     <aside className="w-64 border-r border-slate-200 dark:border-slate-800 flex flex-col bg-white dark:bg-slate-900/60 shrink-0 font-bold select-none text-slate-900 dark:text-white">

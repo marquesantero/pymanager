@@ -1,4 +1,4 @@
-import React, { useMemo, useEffect, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import ReactFlow, { 
   Background, 
   Controls, 
@@ -12,7 +12,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { VenvInfo } from '../../types';
 import { packageService } from '../../services/packageManager';
-import { Loader2, Share2, ZoomIn, Layers, ChevronRight } from 'lucide-react';
+import { Loader2, Layers } from 'lucide-react';
 
 interface StudioDependencyGraphProps {
   venv: VenvInfo;
@@ -68,7 +68,7 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
           type: ConnectionLineType.SmoothStep,
           animated: level < 2,
           style: { stroke: '#3b82f6', strokeWidth: 1.5 },
-          markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6', size: 10 },
+          markerEnd: { type: MarkerType.ArrowClosed, color: '#3b82f6' },
         });
       }
 

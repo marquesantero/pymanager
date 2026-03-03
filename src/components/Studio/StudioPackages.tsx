@@ -143,7 +143,15 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
                   </div>
                   <div className="flex gap-1">
                     <button 
-                      onClick={() => packageService.update(venv, name).then(() => refresh())} 
+                      onClick={async () => {
+                        try {
+                          await packageService.update(venv, name);
+                          setMessage(`Updated ${name}`);
+                          refresh();
+                        } catch (err) {
+                          setMessage(`Error: ${err}`);
+                        }
+                      }} 
                       className="p-2 text-slate-400 hover:text-green-600 transition-colors"
                     >
                       <ArrowUpCircle size={16}/>

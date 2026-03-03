@@ -6,10 +6,9 @@ import { packageService } from "../../services/packageManager";
 
 interface StudioDiagnosticsProps {
   venv: VenvInfo;
-  setMessage: (msg: string) => void;
 }
 
-export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv, setMessage }) => {
+export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) => {
   const [health, setHealth] = useState<string>("");
   const [outdatedPkgs, setOutdatedPkgs] = useState<OutdatedPackage[]>([]);
   const [securityReport, setSecurityReport] = useState<any>(null);

@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open, ask } from "@tauri-apps/plugin-dialog";
-import { Terminal, RefreshCcw, Box, ChevronRight, Loader2, Package, X, Code2, BookmarkPlus, Globe, Settings, ExternalLink, Trash2 } from "lucide-react";
+import { Terminal, RefreshCcw, Box, Loader2, Package, X, Code2, BookmarkPlus, Globe, Settings, ExternalLink, Trash2 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
@@ -135,8 +135,15 @@ export default function App() {
     // Load secondary data in background without blocking UI opening
     try {
       dbService.getScripts(v.path).then(setScripts);
-      invoke("read_env_file", { venvPath: v.path }).then((env: any) => setEnvContent(env));
-      invoke("get_pyvenv_cfg", { venvPath: v.path }).then((cfg: any) => setPyvenvCfg(cfg));
+      invoke("read_env_file", { venvPath: v.path })
+        .then((env: any) => setEnvContent(env))
+        .catch((e) => console.error("Env load error:", e));
+      invoke("get_pyvenv_cfg", { venvPath: v.path })
+        .then((cfg: any) => setPyvenvCfg(cfg))
+        .catch((e) => console.error("pyvenv.cfg load error:", e));
+      invoke("get_venv_details", { path: v.path })
+        .then((details: any) => setVenvDetails(details))
+        .catch((e) => console.error("Venv details load error:", e));
     } catch (e) { console.error("BG Load Error:", e); }
   };
 
@@ -149,8 +156,6 @@ export default function App() {
     healthy: (venvCache[activeWorkspace] || []).filter(v => v.status === "Healthy").length, 
     broken: (venvCache[activeWorkspace] || []).filter(v => v.status === "Broken").length 
   };
-
-  const allTemplates = [...PYTHON_TEMPLATES, ...customTemplates];
 
   if (isInitialLoading) {
     return (
@@ -281,7 +286,14 @@ export default function App() {
                 <div className="flex items-center gap-2">
                     <button onClick={async () => {
                         const n = prompt("Template name:");
-                        if (n && venvDetails) { try { await dbService.saveCustomTemplate(n, venvDetails.packages.map(p => p.split('==')[0])); setCustomTemplates(await dbService.getCustomTemplates()); setMessage(`Saved template: ${n}`); } catch (e) { setMessage(`Error: ${e}`); } }
+                        if (!n) return;
+                        try {
+                          const details = venvDetails || await invoke<VenvDetails>("get_venv_details", { path: selectedVenv.path });
+                          setVenvDetails(details);
+                          await dbService.saveCustomTemplate(n, details.packages.map(p => p.split("==")[0]));
+                          setCustomTemplates(await dbService.getCustomTemplates());
+                          setMessage(`Saved template: ${n}`);
+                        } catch (e) { setMessage(`Error: ${e}`); }
                     }} className="flex items-center gap-2 px-4 py-2 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded-xl border border-blue-100 dark:border-blue-800 text-xs font-black uppercase hover:bg-blue-600 hover:text-white transition-all"><BookmarkPlus size={16}/> Save as Template</button>
                     <button onClick={() => setSelectedVenv(null)} className="p-3 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl hover:bg-slate-100 dark:hover:bg-slate-700 transition-all shadow-sm"><X size={24}/></button>
                 </div>
@@ -296,7 +308,7 @@ export default function App() {
                 {studioTab === "packages" && <StudioPackages venv={selectedVenv} details={venvDetails} refresh={() => openStudio(selectedVenv)} setMessage={setMessage} />}
                 {studioTab === "automation" && <StudioAutomation venv={selectedVenv} scripts={scripts} refreshScripts={() => openStudio(selectedVenv)} setMessage={setMessage} />}
                 {studioTab === "config" && <StudioConfig venv={selectedVenv} envContent={envContent} setEnvContent={setEnvContent} pyvenvCfg={pyvenvCfg} setMessage={setMessage} />}
-                {studioTab === "diagnostics" && <StudioDiagnostics venv={selectedVenv} setMessage={setMessage} />}
+                {studioTab === "diagnostics" && <StudioDiagnostics venv={selectedVenv} />}
                 {studioTab === "deploy" && <StudioDeploy venv={selectedVenv} setMessage={setMessage} />}
               </div>
             </div>
@@ -324,4 +336,3 @@ export default function App() {
       </div>
       );
       }
-

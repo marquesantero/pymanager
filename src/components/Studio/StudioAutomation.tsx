@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Plus, ChevronRight } from "lucide-react";
+import { Play, ChevronRight } from "lucide-react";
 import { VenvInfo, Script } from "../../types";
 import { dbService } from "../../services/db";
 
