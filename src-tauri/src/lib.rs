@@ -334,6 +334,33 @@ pub struct ManagerStatus {
 }
 
 #[tauri::command]
+fn audit_security(venv_path: String) -> Result<serde_json::Value, String> {
+    let python_path = get_python_path(Path::new(&venv_path));
+    
+    // We try to run pip-audit as a module inside the venv for maximum accuracy
+    // Output is requested in JSON format for easy frontend parsing
+    let out = Command::new(python_path)
+        .args(["-m", "pip_audit", "--format", "json"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if out.status.success() {
+        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+    } else {
+        let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+        if err_msg.contains("No module named pip_audit") {
+            Err("pip-audit not installed in this environment.".to_string())
+        } else {
+            // pip-audit returns non-zero if vulnerabilities are found, but we still want the JSON from stdout
+            if !out.stdout.is_empty() {
+                return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+            }
+            Err(err_msg)
+        }
+    }
+}
+
+#[tauri::command]
 fn get_dependency_tree(venv_path: String, engine: String) -> Result<serde_json::Value, String> {
     if engine == "uv" {
         let uv_path = get_manager_path("uv");
@@ -597,7 +624,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            get_package_sizes, generate_docker_files, check_managers, audit_environments, get_dependency_tree,
+            get_package_sizes, generate_docker_files, check_managers, audit_environments, get_dependency_tree, audit_security,
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
             open_terminal, open_in_vscode, create_venv, list_venvs, delete_venv, 
             install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,

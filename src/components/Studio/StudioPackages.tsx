@@ -1,9 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Package, HardDrive, Layers, Upload, ArrowUpCircle, Trash2, Loader2 } from "lucide-react";
+import { Package, HardDrive, Layers, Upload, ArrowUpCircle, Trash2, Loader2, Share2, List, Network } from "lucide-react";
 import { VenvInfo, VenvDetails } from "../../types";
 import { packageService } from "../../services/packageManager";
 import { StudioDependencyTree } from "./StudioDependencyTree";
+import { StudioDependencyGraph } from "./StudioDependencyGraph";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
@@ -11,7 +12,7 @@ function cn(...inputs: ClassValue[]) { return twMerge(clsx(inputs)); }
 
 interface StudioPackagesProps {
   venv: VenvInfo;
-  details: VenvDetails | null; // This will be null initially due to lazy load
+  details: VenvDetails | null;
   refresh: () => void;
   setMessage: (msg: string) => void;
 }
@@ -21,9 +22,8 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
   const [packageSizes, setPackageSizes] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(!initialDetails);
   const [loadingSizes, setLoadingSizes] = useState(false);
-  const [viewMode, setViewMode] = useState<"list" | "tree">("list");
+  const [viewMode, setViewMode] = useState<"list" | "tree" | "graph">("list");
 
-  // Step 1: Load Package List & Overall Disk Size
   useEffect(() => {
     const fetchDetails = async () => {
       setLoading(true);
@@ -39,7 +39,6 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
     fetchDetails();
   }, [venv]);
 
-  // Step 2: Load Individual Package Sizes (Deep Scan)
   useEffect(() => {
     if (!localDetails) return;
     const fetchSizes = async () => {
@@ -109,9 +108,10 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
         <div className="flex items-center justify-between select-none px-2">
           <div className="flex items-center gap-4">
             <h4 className="font-black text-sm uppercase tracking-widest">Library Manifest</h4>
-            <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl border border-slate-200 dark:border-slate-700">
-              <button onClick={() => setViewMode("list")} className={cn("px-3 py-1 rounded-lg text-[9px] font-black uppercase transition-all", viewMode === "list" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}>Flat List</button>
-              <button onClick={() => setViewMode("tree")} className={cn("px-3 py-1 rounded-lg text-[9px] font-black uppercase transition-all", viewMode === "tree" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}>Tree View</button>
+            <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl border border-slate-200 dark:border-slate-700 shadow-inner">
+              <button onClick={() => setViewMode("list")} className={cn("flex items-center gap-1.5 px-3 py-1 rounded-lg text-[9px] font-black uppercase transition-all", viewMode === "list" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}><List size={12}/> Flat</button>
+              <button onClick={() => setViewMode("tree")} className={cn("flex items-center gap-1.5 px-3 py-1 rounded-lg text-[9px] font-black uppercase transition-all", viewMode === "tree" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}><Network size={12}/> Tree</button>
+              <button onClick={() => setViewMode("graph")} className={cn("flex items-center gap-1.5 px-3 py-1 rounded-lg text-[9px] font-black uppercase transition-all", viewMode === "graph" ? "bg-white dark:bg-slate-700 text-blue-600 shadow-sm" : "text-slate-400")}><Share2 size={12}/> Graph</button>
             </div>
           </div>
           <div className="flex items-center gap-4">
@@ -120,12 +120,12 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
               onClick={async () => { try { setMessage(await packageService.exportRequirements(venv.path)); } catch (e) { setMessage(`Error: ${e}`); } }} 
               className="text-xs font-bold text-blue-600 hover:underline flex items-center gap-2"
             >
-              <Upload size={14}/> Export requirements.txt
+              <Upload size={14}/> Export
             </button>
           </div>
         </div>
         
-        {viewMode === "list" ? (
+        {viewMode === "list" && (
           <div className="grid grid-cols-1 md:grid-cols-2 2xl:grid-cols-3 gap-3">
             {localDetails?.packages?.map((pkg, i) => {
               const name = pkg.split('==')[0];
@@ -159,9 +159,10 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
               );
             })}
           </div>
-        ) : (
-          <StudioDependencyTree venv={venv} />
         )}
+
+        {viewMode === "tree" && <StudioDependencyTree venv={venv} />}
+        {viewMode === "graph" && <StudioDependencyGraph venv={venv} />}
       </div>
     </div>
   );

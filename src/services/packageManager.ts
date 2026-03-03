@@ -46,6 +46,13 @@ class PackageManagerService {
   }
 
   /**
+   * Realiza auditoria de segurança (vulnerabilidades)
+   */
+  async auditSecurity(venvPath: string): Promise<any> {
+    return await invoke("audit_security", { venvPath });
+  }
+
+  /**
    * Exporta os requisitos (sempre gera requirements.txt para compatibilidade)
    */
   async exportRequirements(venvPath: string): Promise<string> {
