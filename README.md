@@ -1,66 +1,75 @@
-# PyManager 🐍
+# PyManager Orchestrator 🐍
 
-A professional, high-level, multi-platform Python Virtual Environment Manager built with **Tauri v2**, **Rust**, **React 19**, and **Tailwind CSS v4**.
+A professional, high-level Python Virtual Environment Orchestrator built with **Tauri v2**, **Rust**, **React 19**, and **Tailwind CSS v4**.
 
-PyManager solves the common "venv hell" by providing a centralized dashboard to scan, health-check, and optimize your Python development environments across multiple workspaces.
+PyManager has evolved from a simple manager into a complete development lifecycle orchestrator, solving the "venv hell" with visual intelligence and automated hygiene.
 
-## ✨ Key Features
+---
 
-- **🚀 Multi-Workspace Scanning:** Recursively discover `.venv` and custom environments across multiple project directories.
-- **🔬 Python Dev Studio:** A dedicated management interface for each environment.
-- **📊 Package Size Explorer:** Visualize the disk impact of each installed library in MB.
-- **🐳 Docker Generator:** One-click generation of optimized `Dockerfile` and `docker-compose.yml` for your specific environment version and packages.
-- **🛠️ Automation Runner:** Save and execute Python automation scripts directly within the environment context.
-- **🩹 Health Diagnostics:** Integrated `pip check` and outdated package detection.
-- **📝 Config Editor:** Side-by-side `.env` editor and `pyvenv.cfg` viewer.
-- **📦 Custom Templates:** Save any existing environment as a template to bootstrap new projects instantly.
-- **💾 SQLite Persistence:** Your workspaces, environment cache, and scripts are stored locally using SQLite.
+## ✨ New & Advanced Features
+
+### 🚀 Hybrid Management Engine
+- **pip + uv Dual-Core:** Native support for the [uv](https://github.com/astral-sh/uv) manager. Create environments and install templates up to **100x faster**.
+- **Auto-Discovery:** Automatically detects if an environment uses `pip` or `uv` and uses the correct motor for all operations.
+
+### 🔍 Global Intelligence & Discovery
+- **Command Palette (Ctrl+K):** Instant navigation. Search for environments or paths across all your workspaces from anywhere in the app.
+- **Global Hygiene:** A specialized auditor that syncs your database with the physical disk, allowing you to **Prune** dead links and **Adopt** orphan environments.
+
+### 🌳 Dependency Visualizer
+- **Interactive Graph:** Visualize your libraries as a visual map using **React Flow**. Understand complex relationships with zoom and pan controls.
+- **Lazy-Loaded Tree View:** Explore hierarchical dependencies without performance lag, even in massive environments like Anaconda.
+
+### 🛡️ Security & Health
+- **Security Audit:** Integrated scan for known vulnerabilities (CVEs) using the PyPA Advisory Database.
+- **Health Diagnostics:** One-click consistency checks (`pip check`) and outdated package detection.
+
+### 🐳 Deployment & Automation
+- **Docker Generator:** Optimized `Dockerfile` and `docker-compose.yml` generation based on your environment's Python version and packages.
+- **Script Runner:** Save and execute automation snippets directly within the virtual environment context.
+
+---
 
 ## 🛠️ Tech Stack
 
-- **Framework:** [Tauri v2](https://tauri.app/) (Desktop bridge)
-- **Backend:** [Rust](https://www.rust-lang.org/) (File system performance & system commands)
+- **Framework:** [Tauri v2](https://tauri.app/)
+- **Backend:** [Rust](https://www.rust-lang.org/) (Performance & OS Bridge)
 - **Frontend:** [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/)
-- **Styling:** [Tailwind CSS v4](https://tailwindcss.com/) (Modern Flat Design)
+- **Graph Engine:** [React Flow](https://reactflow.dev/)
 - **Database:** [SQLite](https://www.sqlite.org/) via `tauri-plugin-sql`
-- **Icons:** [Lucide React](https://lucide.dev/)
+- **Styling:** [Tailwind CSS v4](https://tailwindcss.com/)
+
+---
 
 ## 🚀 Getting Started
 
 ### Prerequisites
-
 - [Rust](https://rustup.rs/) (1.85.1+)
 - [Node.js](https://nodejs.org/) (v20+)
-- System Dependencies (for Linux/Tauri build)
+- [uv](https://github.com/astral-sh/uv) (Optional but highly recommended for speed)
 
 ### Installation
-
 1. Clone the repository:
    ```bash
    git clone https://github.com/marquesantero/pymanager.git
    cd pymanager
    ```
-
 2. Install dependencies:
    ```bash
    npm install
    ```
-
 3. Run in development mode:
    ```bash
    npm run tauri dev
    ```
 
-## 🏗️ Build
+---
 
-To build the production application:
+## 🏗️ Build
+To build the production-ready application for your OS:
 ```bash
 npm run tauri build
 ```
 
-## 📄 License
-
-Distributed under the MIT License. See `LICENSE` for more information.
-
 ---
-Created by [Marques Antero](https://github.com/marquesantero)
+*Created by [Marques Antero](https://github.com/marquesantero). Python development, orchestrated.*
