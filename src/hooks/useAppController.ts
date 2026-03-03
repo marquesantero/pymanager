@@ -160,8 +160,14 @@ export function useWorkspaceOperations({
   setMessage,
   setVenvCache
 }: WorkspaceOpsConfig) {
+  const scanInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
+
   const scanWorkspace = useCallback(async (workspacePath: string) => {
     if (!workspacePath) return;
+    const existing = scanInFlightRef.current.get(workspacePath);
+    if (existing) return existing;
+
+    const task = (async () => {
     setLoading(true);
     setMessage("Scanning...");
 
@@ -174,7 +180,12 @@ export function useWorkspaceOperations({
       setMessage(`Error: ${err}`);
     } finally {
       setLoading(false);
+      scanInFlightRef.current.delete(workspacePath);
     }
+    })();
+
+    scanInFlightRef.current.set(workspacePath, task);
+    return task;
   }, [setLoading, setMessage, setVenvCache]);
 
   const syncSingleVenv = useCallback(async (venvPath: string) => {

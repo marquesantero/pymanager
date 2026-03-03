@@ -96,6 +96,13 @@ class PackageManagerService {
     return request;
   }
 
+  async checkDependencyTreePrereq(venv: VenvInfo): Promise<{ ok: boolean; message?: string | null }> {
+    return await invoke("check_dependency_tree_prereq", {
+      venvPath: venv.path,
+      engine: venv.manager_type
+    });
+  }
+
   /**
    * Realiza auditoria de segurança (vulnerabilidades)
    */

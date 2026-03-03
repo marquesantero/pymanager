@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use walkdir::WalkDir;
 use tauri_plugin_sql::{Migration, MigrationKind};
+const ENGINE_MARKER_FILE: &str = ".pymanager-engine";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VenvInfo {
@@ -40,6 +41,12 @@ pub struct OutdatedPackage {
 pub struct VenvSetupResult {
     venv_path: String,
     installed: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DependencyTreePrereq {
+    ok: bool,
+    message: Option<String>,
 }
 
 // --- Internal Helpers ---
@@ -109,11 +116,7 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
                 _ => { status = "Broken".to_string(); issue = Some("Interpreter corrupted".to_string()); }
             }
         }
-        let manager_type = if p.join("uv.lock").exists() || p.parent().map_or(false, |parent| parent.join("uv.lock").exists()) {
-            "uv".to_string()
-        } else {
-            "pip".to_string()
-        };
+        let manager_type = detect_manager_type(p);
 
         return Some(VenvInfo { 
             name: p.file_name().unwrap_or_default().to_string_lossy().to_string(), 
@@ -126,6 +129,154 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
         });
     }
     None
+}
+
+fn detect_manager_type(venv_path: &Path) -> String {
+    let marker = venv_path.join(ENGINE_MARKER_FILE);
+    if let Ok(raw) = fs::read_to_string(&marker) {
+        let value = raw.trim().to_lowercase();
+        if value == "uv" || value == "pip" {
+            return value;
+        }
+    }
+
+    // uv-created venvs write "uv = <version>" into pyvenv.cfg.
+    let cfg_path = venv_path.join("pyvenv.cfg");
+    if let Ok(cfg) = fs::read_to_string(cfg_path) {
+        if cfg.lines().any(|line| line.trim_start().starts_with("uv =")) {
+            return "uv".to_string();
+        }
+    }
+
+    if venv_path.join("uv.lock").exists() || venv_path.parent().map_or(false, |parent| parent.join("uv.lock").exists()) {
+        return "uv".to_string();
+    }
+
+    "pip".to_string()
+}
+
+fn persist_engine_marker(venv_path: &Path, engine: &str) {
+    let marker = venv_path.join(ENGINE_MARKER_FILE);
+    let _ = fs::write(marker, engine);
+}
+
+fn uv_cache_dir_for(base: &Path) -> String {
+    base.join(".uv-cache").to_string_lossy().to_string()
+}
+
+fn list_installed_packages(venv: &Path) -> Result<Vec<String>, String> {
+    let python = get_python_path(venv);
+    let script = r#"import importlib.metadata as m
+pkgs = []
+for d in m.distributions():
+    name = d.metadata.get("Name") or d.metadata.get("name") or d.name
+    if name:
+        pkgs.append(f"{name}=={d.version}")
+for line in sorted(set(pkgs), key=lambda s: s.lower()):
+    print(line)
+"#;
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", script]);
+    let output = run_command_with_timeout(&mut cmd, 120)?;
+    if !output.status.success() {
+        return Err(format!("Failed to list packages: {}", stdout_or_stderr(&output).trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect())
+}
+
+fn build_dependency_tree_with_python(venv: &Path) -> Result<serde_json::Value, String> {
+    let python = get_python_path(venv);
+    let script = r#"import json, re, importlib.metadata as m
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+packages = {}
+deps = {}
+
+for dist in m.distributions():
+    name = dist.metadata.get("Name") or dist.metadata.get("name") or dist.name
+    if not name:
+        continue
+    key = norm(name)
+    packages[key] = {"name": name, "version": dist.version or "unknown"}
+    requires = []
+    for req in (dist.requires or []):
+        base = req.split(";", 1)[0].strip()
+        if not base:
+            continue
+        base = base.split("[", 1)[0].strip()
+        match = re.match(r"([A-Za-z0-9_.-]+)", base)
+        if match:
+            requires.append(norm(match.group(1)))
+    deps[key] = requires
+
+referenced = set()
+for children in deps.values():
+    for child in children:
+        if child in packages:
+            referenced.add(child)
+
+roots = sorted([k for k in packages.keys() if k not in referenced])
+if not roots:
+    roots = sorted(packages.keys())
+
+def build(node_key: str, stack):
+    info = packages[node_key]
+    if node_key in stack:
+        return {"package_name": info["name"], "installed_version": info["version"], "dependencies": []}
+
+    next_stack = set(stack)
+    next_stack.add(node_key)
+
+    children = []
+    for dep_key in deps.get(node_key, []):
+        if dep_key in packages:
+            children.append(build(dep_key, next_stack))
+    children.sort(key=lambda x: (x.get("package_name") or "").lower())
+
+    return {
+        "package_name": info["name"],
+        "installed_version": info["version"],
+        "dependencies": children,
+    }
+
+tree = [build(root, set()) for root in roots]
+print(json.dumps(tree))
+"#;
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", script]);
+    let out = run_command_with_timeout(&mut cmd, 180)?;
+    if out.status.success() {
+        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+    } else {
+        Err(format!("Failed to build dependency tree: {}", stdout_or_stderr(&out).trim()))
+    }
+}
+
+fn parse_outdated_packages_json(raw: &[u8]) -> Result<Vec<OutdatedPackage>, String> {
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
+    let arr = value.as_array().ok_or_else(|| "Invalid outdated packages response format".to_string())?;
+    let mut items = Vec::with_capacity(arr.len());
+    for row in arr {
+        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let version = row.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let latest_version = row
+            .get("latest_version")
+            .or_else(|| row.get("latest-version"))
+            .or_else(|| row.get("latest"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !name.is_empty() {
+            items.push(OutdatedPackage { name, version, latest_version });
+        }
+    }
+    Ok(items)
+}
+
+fn parse_security_audit_json_from_output(out: &Output) -> Result<serde_json::Value, String> {
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
 }
 
 fn safe_dir_size_mb(root: &Path, max_entries: usize) -> f64 {
@@ -392,9 +543,20 @@ services:
 async fn check_venv_health(venv_path: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let venv = ensure_venv_dir(&venv_path)?;
-        let pip = get_pip_path(&venv);
-        let mut cmd = Command::new(pip);
-        cmd.arg("check");
+        let manager = detect_manager_type(&venv);
+        let mut cmd = if manager == "uv" {
+            let uv_path = get_manager_path("uv");
+            let python = get_python_path(&venv);
+            let mut c = Command::new(uv_path);
+            c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+            c.args(["pip", "check", "--python", python.to_str().unwrap()]);
+            c
+        } else {
+            let python = get_python_path(&venv);
+            let mut c = Command::new(python);
+            c.args(["-m", "pip", "check"]);
+            c
+        };
         let out = run_command_with_timeout(&mut cmd, 90)?;
         if out.status.success() {
             Ok("No conflicts found.".into())
@@ -412,12 +574,23 @@ async fn check_venv_health(venv_path: String) -> Result<String, String> {
 async fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let venv = ensure_venv_dir(&venv_path)?;
-        let pip = get_pip_path(&venv);
-        let mut cmd = Command::new(pip);
-        cmd.args(["list", "--outdated", "--format=json"]);
+        let manager = detect_manager_type(&venv);
+        let mut cmd = if manager == "uv" {
+            let uv_path = get_manager_path("uv");
+            let python = get_python_path(&venv);
+            let mut c = Command::new(uv_path);
+            c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+            c.args(["pip", "list", "--outdated", "--format", "json", "--python", python.to_str().unwrap()]);
+            c
+        } else {
+            let python = get_python_path(&venv);
+            let mut c = Command::new(python);
+            c.args(["-m", "pip", "list", "--outdated", "--format=json"]);
+            c
+        };
         let out = run_command_with_timeout(&mut cmd, 120)?;
         if out.status.success() {
-            let pkgs: Vec<OutdatedPackage> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+            let pkgs = parse_outdated_packages_json(&out.stdout)?;
             Ok(pkgs)
         } else {
             Err(format!("Failed to list outdated packages: {}", stdout_or_stderr(&out).trim()))
@@ -536,6 +709,75 @@ fn open_terminal(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_terminal_with_venv_command(path: String, command: String) -> Result<(), String> {
+    let venv = ensure_venv_dir(&path)?;
+    let safe_path = venv.to_string_lossy().to_string();
+
+    #[cfg(target_os = "linux")]
+    {
+        let activate_cmd = format!("source \"{}/bin/activate\" && {} ; exec bash", safe_path, command);
+        // Try common terminal emulators with command execution support.
+        if Command::new("gnome-terminal")
+            .args(["--working-directory", &safe_path, "--", "bash", "-lc", &activate_cmd])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Command::new("konsole")
+            .args(["--workdir", &safe_path, "-e", "bash", "-lc", &activate_cmd])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Command::new("xfce4-terminal")
+            .args(["--working-directory", &safe_path, "--command", &format!("bash -lc '{}'", activate_cmd.replace('\'', "'\\''"))])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Command::new("xterm")
+            .args(["-e", "bash", "-lc", &activate_cmd])
+            .current_dir(&safe_path)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        return Err("No supported terminal emulator found on PATH".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let activate = format!("{}\\Scripts\\activate.bat", safe_path);
+        let cmdline = format!("\"{}\" && {} ", activate, command);
+        Command::new("cmd")
+            .args(["/c", "start", "cmd.exe", "/k", &cmdline])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Terminal\" to do script \"cd '{}' && source '{}/bin/activate' && {}\"",
+            safe_path.replace('\'', "\\'"),
+            safe_path.replace('\'', "\\'"),
+            command.replace('\"', "\\\"")
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+}
+
+#[tauri::command]
 fn open_in_vscode(path: String) -> Result<(), String> {
     let pb = ensure_venv_dir(&path)?;
     let parent = pb.parent().unwrap_or(&pb).to_string_lossy().to_string();
@@ -587,10 +829,20 @@ fn start_diagnostics_job(venv_path: String, state: tauri::State<'_, AppState>) -
         let blocking_job = job.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
             let venv = ensure_venv_dir(&venv_path)?;
-            let pip = get_pip_path(&venv);
+            let manager = detect_manager_type(&venv);
+            let python = get_python_path(&venv);
 
-            let mut check_cmd = Command::new(&pip);
-            check_cmd.arg("check");
+            let mut check_cmd = if manager == "uv" {
+                let uv_path = get_manager_path("uv");
+                let mut c = Command::new(uv_path);
+                c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                c.args(["pip", "check", "--python", python.to_str().unwrap()]);
+                c
+            } else {
+                let mut c = Command::new(&python);
+                c.args(["-m", "pip", "check"]);
+                c
+            };
             let health_out = run_command_with_timeout_and_cancel(&mut check_cmd, 90, blocking_job.cancel.as_ref())?;
             let health = if health_out.status.success() {
                 "No conflicts found.".to_string()
@@ -598,8 +850,17 @@ fn start_diagnostics_job(venv_path: String, state: tauri::State<'_, AppState>) -
                 stdout_or_stderr(&health_out)
             };
 
-            let mut outdated_cmd = Command::new(&pip);
-            outdated_cmd.args(["list", "--outdated", "--format=json"]);
+            let mut outdated_cmd = if manager == "uv" {
+                let uv_path = get_manager_path("uv");
+                let mut c = Command::new(uv_path);
+                c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                c.args(["pip", "list", "--outdated", "--format", "json", "--python", python.to_str().unwrap()]);
+                c
+            } else {
+                let mut c = Command::new(&python);
+                c.args(["-m", "pip", "list", "--outdated", "--format=json"]);
+                c
+            };
             let outdated_out = run_command_with_timeout_and_cancel(&mut outdated_cmd, 120, blocking_job.cancel.as_ref())?;
             if !outdated_out.status.success() {
                 return Err(format!(
@@ -607,7 +868,7 @@ fn start_diagnostics_job(venv_path: String, state: tauri::State<'_, AppState>) -
                     stdout_or_stderr(&outdated_out).trim()
                 ));
             }
-            let outdated: Vec<OutdatedPackage> = serde_json::from_slice(&outdated_out.stdout).map_err(|e| e.to_string())?;
+            let outdated = parse_outdated_packages_json(&outdated_out.stdout)?;
 
             Ok(serde_json::json!({
                 "health": health,
@@ -634,19 +895,37 @@ fn start_security_audit_job(venv_path: String, state: tauri::State<'_, AppState>
         let blocking_job = job.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
             let venv = ensure_venv_dir(&venv_path)?;
+            let manager = detect_manager_type(&venv);
             let python_path = get_python_path(&venv);
-            let mut cmd = Command::new(python_path);
+            let python_str = python_path.to_string_lossy().to_string();
+
+            let mut cmd = Command::new(&python_path);
             cmd.args(["-m", "pip_audit", "--format", "json"]);
             let out = run_command_with_timeout_and_cancel(&mut cmd, 180, blocking_job.cancel.as_ref())?;
 
             if out.status.success() {
-                serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+                parse_security_audit_json_from_output(&out)
             } else {
                 let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
                 if err_msg.contains("No module named pip_audit") {
-                    Err("pip-audit not installed in this environment.".to_string())
+                    if manager == "uv" {
+                        let uv_path = get_manager_path("uv");
+                        let mut uvx = Command::new(uv_path);
+                        uvx.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                        uvx.args(["tool", "run", "--from", "pip-audit", "pip-audit", "--format", "json", "--python", &python_str]);
+                        let uvx_out = run_command_with_timeout_and_cancel(&mut uvx, 240, blocking_job.cancel.as_ref())?;
+                        if uvx_out.status.success() {
+                            parse_security_audit_json_from_output(&uvx_out)
+                        } else if !uvx_out.stdout.is_empty() {
+                            parse_security_audit_json_from_output(&uvx_out)
+                        } else {
+                            Err(format!("pip-audit not installed in this environment. Install with: uv pip install --python \"{}\" pip-audit", python_str))
+                        }
+                    } else {
+                        Err("pip-audit not installed in this environment. Install with: pip install pip-audit".to_string())
+                    }
                 } else if !out.stdout.is_empty() {
-                    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+                    parse_security_audit_json_from_output(&out)
                 } else {
                     Err(err_msg)
                 }
@@ -701,24 +980,41 @@ fn cancel_background_job(job_id: String, state: tauri::State<'_, AppState>) -> R
 async fn audit_security(venv_path: String) -> Result<serde_json::Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let venv = ensure_venv_dir(&venv_path)?;
+        let manager = detect_manager_type(&venv);
         let python_path = get_python_path(&venv);
+        let python_str = python_path.to_string_lossy().to_string();
         
         // We try to run pip-audit as a module inside the venv for maximum accuracy
         // Output is requested in JSON format for easy frontend parsing
-        let mut cmd = Command::new(python_path);
+        let mut cmd = Command::new(&python_path);
         cmd.args(["-m", "pip_audit", "--format", "json"]);
         let out = run_command_with_timeout(&mut cmd, 180)?;
 
         if out.status.success() {
-            serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+            parse_security_audit_json_from_output(&out)
         } else {
             let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
             if err_msg.contains("No module named pip_audit") {
-                Err("pip-audit not installed in this environment.".to_string())
+                if manager == "uv" {
+                    let uv_path = get_manager_path("uv");
+                    let mut uvx = Command::new(uv_path);
+                    uvx.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                    uvx.args(["tool", "run", "--from", "pip-audit", "pip-audit", "--format", "json", "--python", &python_str]);
+                    let uvx_out = run_command_with_timeout(&mut uvx, 240)?;
+                    if uvx_out.status.success() {
+                        parse_security_audit_json_from_output(&uvx_out)
+                    } else if !uvx_out.stdout.is_empty() {
+                        parse_security_audit_json_from_output(&uvx_out)
+                    } else {
+                        Err(format!("pip-audit not installed in this environment. Install with: uv pip install --python \"{}\" pip-audit", python_str))
+                    }
+                } else {
+                    Err("pip-audit not installed in this environment. Install with: pip install pip-audit".to_string())
+                }
             } else {
                 // pip-audit returns non-zero if vulnerabilities are found, but we still want the JSON from stdout
                 if !out.stdout.is_empty() {
-                    return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+                    return parse_security_audit_json_from_output(&out);
                 }
                 Err(err_msg)
             }
@@ -733,16 +1029,7 @@ async fn get_dependency_tree(venv_path: String, engine: String) -> Result<serde_
     tauri::async_runtime::spawn_blocking(move || {
         let venv = ensure_venv_dir(&venv_path)?;
         if engine == "uv" {
-            let uv_path = get_manager_path("uv");
-            let python_path = get_python_path(&venv);
-            let mut cmd = Command::new(uv_path);
-            cmd.args(["tree", "--format", "json", "--python", python_path.to_str().unwrap()]);
-            let out = run_command_with_timeout(&mut cmd, 180)?;
-            if out.status.success() {
-                return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
-            } else {
-                return Err(String::from_utf8_lossy(&out.stderr).to_string());
-            }
+            return build_dependency_tree_with_python(&venv);
         }
 
         // For PIP, we use pipdeptree. It needs to be installed in the venv.
@@ -754,7 +1041,62 @@ async fn get_dependency_tree(venv_path: String, engine: String) -> Result<serde_
         if out.status.success() {
             serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
         } else {
-            Err("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string())
+            let raw_err = stdout_or_stderr(&out);
+            let err_lc = raw_err.to_lowercase();
+            if err_lc.contains("no module named pipdeptree")
+                || (err_lc.contains("modulenotfounderror") && err_lc.contains("pipdeptree"))
+            {
+                Err("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string())
+            } else if raw_err.trim().is_empty() {
+                Err("Failed to build dependency tree for this environment.".to_string())
+            } else {
+                Err(raw_err)
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn check_dependency_tree_prereq(venv_path: String, engine: String) -> Result<DependencyTreePrereq, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+
+        if engine == "uv" {
+            return Ok(DependencyTreePrereq { ok: true, message: None });
+        }
+
+        let python_path = get_python_path(&venv);
+        let mut cmd = Command::new(python_path);
+        cmd.args([
+            "-c",
+            "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('pipdeptree') else 1)",
+        ]);
+
+        match run_command_with_timeout(&mut cmd, 4) {
+            Ok(out) if out.status.success() => Ok(DependencyTreePrereq { ok: true, message: None }),
+            Ok(out) => {
+                let raw_err = stdout_or_stderr(&out);
+                let err_lc = raw_err.to_lowercase();
+                if err_lc.contains("no module named pipdeptree")
+                    || (err_lc.contains("modulenotfounderror") && err_lc.contains("pipdeptree"))
+                {
+                    Ok(DependencyTreePrereq {
+                        ok: false,
+                        message: Some("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string()),
+                    })
+                } else {
+                    // Non-zero for other reasons: don't block tree loading with a false missing-tool error.
+                    Ok(DependencyTreePrereq { ok: true, message: None })
+                }
+            }
+            Err(err) => {
+                // Avoid false negatives in prereq check. If check fails unexpectedly, allow tree command
+                // to run and report the real error instead of claiming missing dependency.
+                let _ = err;
+                Ok(DependencyTreePrereq { ok: true, message: None })
+            }
         }
     })
     .await
@@ -864,7 +1206,7 @@ fn get_manager_path(cmd: &str) -> String {
 
 fn create_venv_internal(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
     let root = canonicalize_dir(&path)?;
-    let mut full_path = root;
+    let mut full_path = root.clone();
     full_path.push(&name);
     let target_path = full_path.to_str().unwrap();
 
@@ -872,11 +1214,13 @@ fn create_venv_internal(path: String, name: String, python_bin: String, engine: 
         let uv_path = get_manager_path("uv");
         let mut cmd = Command::new(uv_path);
         cmd.args(["venv", target_path]);
+        cmd.env("UV_CACHE_DIR", uv_cache_dir_for(&root));
         if !python_bin.is_empty() {
             cmd.arg("--python").arg(&python_bin);
         }
         let output = cmd.output().map_err(|e| e.to_string())?;
         if output.status.success() {
+            persist_engine_marker(Path::new(target_path), "uv");
             return Ok(target_path.to_string());
         } else {
             return Err(String::from_utf8_lossy(&output.stderr).to_string());
@@ -893,6 +1237,7 @@ fn create_venv_internal(path: String, name: String, python_bin: String, engine: 
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
+        persist_engine_marker(Path::new(target_path), "pip");
         Ok(target_path.to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
@@ -905,6 +1250,7 @@ fn install_dependency_internal(venv_path: String, package: String, engine: Strin
         let uv_path = get_manager_path("uv");
         let python_path = get_python_path(&venv);
         let output = Command::new(uv_path)
+            .env("UV_CACHE_DIR", uv_cache_dir_for(&venv))
             .args(["pip", "install", "--python", python_path.to_str().unwrap(), &package])
             .output()
             .map_err(|e| e.to_string())?;
@@ -977,6 +1323,7 @@ fn uninstall_package(venv_path: String, package: String, engine: String) -> Resu
         let uv_path = get_manager_path("uv");
         let python_path = get_python_path(&venv);
         let out = Command::new(uv_path)
+            .env("UV_CACHE_DIR", uv_cache_dir_for(&venv))
             .args(["pip", "uninstall", "--python", python_path.to_str().unwrap(), "-y", &package])
             .output().map_err(|e| e.to_string())?;
         if out.status.success() { return Ok(format!("uv uninstalled {}", package)); }
@@ -995,6 +1342,7 @@ fn update_package(venv_path: String, package: String, engine: String) -> Result<
         let uv_path = get_manager_path("uv");
         let python_path = get_python_path(&venv);
         let out = Command::new(uv_path)
+            .env("UV_CACHE_DIR", uv_cache_dir_for(&venv))
             .args(["pip", "install", "--upgrade", "--python", python_path.to_str().unwrap(), &package])
             .output().map_err(|e| e.to_string())?;
         if out.status.success() { return Ok(format!("uv updated {}", package)); }
@@ -1011,14 +1359,7 @@ async fn get_venv_details(path: String) -> Result<VenvDetails, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let p = ensure_venv_dir(&path)?;
         let size_mb = safe_dir_size_mb(&p, 300_000);
-        let pip = get_pip_path(&p);
-        let mut cmd = Command::new(pip);
-        cmd.args(["list", "--format=freeze"]);
-        let output = run_command_with_timeout(&mut cmd, 120)?;
-        if !output.status.success() {
-            return Err(format!("Failed to list packages: {}", stdout_or_stderr(&output).trim()));
-        }
-        let packages = String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect();
+        let packages = list_installed_packages(&p)?;
         Ok(VenvDetails { packages, size_mb })
     })
     .await
@@ -1069,9 +1410,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             start_diagnostics_job, start_security_audit_job, get_background_job, cancel_background_job,
+            check_dependency_tree_prereq,
             get_package_sizes, generate_docker_files, check_managers, audit_environments, get_dependency_tree, audit_security,
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
-            open_terminal, open_in_vscode, create_venv, create_venv_with_template, list_venvs, delete_venv, 
+            open_terminal, open_terminal_with_venv_command, open_in_vscode, create_venv, create_venv_with_template, list_venvs, delete_venv, 
             install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,
             export_requirements, get_pyvenv_cfg, search_pypi
         ])

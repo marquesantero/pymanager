@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ShieldAlert, AlertCircle, CheckCircle2, Loader2, RefreshCcw, ExternalLink, ShieldCheck } from "lucide-react";
 import { VenvInfo, OutdatedPackage } from "../../types";
+import { packageService } from "../../services/packageManager";
 
 interface StudioDiagnosticsProps {
   venv: VenvInfo;
@@ -14,11 +15,18 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
   const [loadingHealth, setLoadingHealth] = useState(false);
   const [loadingSecurity, setLoadingSecurity] = useState(false);
   const [securityError, setSecurityError] = useState<string | null>(null);
+  const [installingSecurityTool, setInstallingSecurityTool] = useState(false);
+  const [openingSecurityTerminal, setOpeningSecurityTerminal] = useState(false);
   const [hasRunDiagnostics, setHasRunDiagnostics] = useState(false);
   const [diagnosticsJobId, setDiagnosticsJobId] = useState<string | null>(null);
   const [securityJobId, setSecurityJobId] = useState<string | null>(null);
   const diagnosticsJobIdRef = useRef<string | null>(null);
   const securityJobIdRef = useRef<string | null>(null);
+  const securityInstallCmd = venv.manager_type === "uv"
+    ? `uv pip install --python "${venv.path}/bin/python" pip-audit`
+    : "pip install pip-audit";
+  const showMissingSecurityToolHelp =
+    /pip-audit not installed|no module named pip_audit/i.test(securityError || "");
 
   const runFullDiagnostics = async () => {
     try {
@@ -237,9 +245,49 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
         {securityError ? (
           <div className="p-6 bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/30 rounded-[2rem] text-center">
             <p className="text-xs text-red-600 font-bold mb-4">{securityError}</p>
-            <code className="text-[10px] font-mono text-blue-600 dark:text-blue-400 block p-3 bg-white dark:bg-slate-950 rounded-xl border border-red-100 dark:border-red-900/20">
-              pip install pip-audit
-            </code>
+            {showMissingSecurityToolHelp && (
+              <div className="p-4 bg-white dark:bg-slate-900 rounded-2xl text-left border border-red-100 dark:border-red-900/20 shadow-sm">
+                <code className="text-[10px] font-mono text-blue-600 dark:text-blue-400 block p-3 bg-slate-50 dark:bg-slate-950 rounded-xl border border-red-100 dark:border-red-900/20">
+                  {securityInstallCmd}
+                </code>
+                <div className="mt-4 flex gap-2">
+                  <button
+                    onClick={async () => {
+                      setInstallingSecurityTool(true);
+                      try {
+                        await packageService.install(venv, "pip-audit");
+                        setSecurityError(null);
+                        await runSecurityAudit();
+                      } catch (installErr: any) {
+                        setSecurityError(installErr?.toString?.() || "Failed to install pip-audit.");
+                      } finally {
+                        setInstallingSecurityTool(false);
+                      }
+                    }}
+                    disabled={installingSecurityTool || openingSecurityTerminal || loadingSecurity}
+                    className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-[10px] font-black uppercase disabled:opacity-50"
+                  >
+                    {installingSecurityTool ? "Installing..." : "Install Now"}
+                  </button>
+                  <button
+                    onClick={async () => {
+                      setOpeningSecurityTerminal(true);
+                      try {
+                        await invoke("open_terminal_with_venv_command", { path: venv.path, command: securityInstallCmd });
+                      } catch (openErr: any) {
+                        setSecurityError(openErr?.toString?.() || "Failed to open terminal with command.");
+                      } finally {
+                        setOpeningSecurityTerminal(false);
+                      }
+                    }}
+                    disabled={openingSecurityTerminal || installingSecurityTool || loadingSecurity}
+                    className="px-3 py-1.5 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-[10px] font-black uppercase disabled:opacity-50"
+                  >
+                    {openingSecurityTerminal ? "Opening..." : "Open Install Command"}
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         ) : securityReport ? (
           <div className="space-y-4">

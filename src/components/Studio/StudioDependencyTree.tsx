@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { ChevronRight, ChevronDown, Package, Layers, Info, Loader2, RefreshCcw } from "lucide-react";
 import { VenvInfo } from "../../types";
 import { packageService } from "../../services/packageManager";
@@ -71,6 +72,11 @@ export const StudioDependencyTree: React.FC<StudioDependencyTreeProps> = ({ venv
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [visibleRoots, setVisibleRoots] = useState(120);
+  const [installingTool, setInstallingTool] = useState(false);
+  const [openingTerminal, setOpeningTerminal] = useState(false);
+  const showMissingToolHelp =
+    venv.manager_type === "pip" &&
+    /pipdeptree not found|no module named pipdeptree|missing dependency tree tool/i.test(error || "");
 
   const fetchTree = async (force = false) => {
     setLoading(true);
@@ -105,12 +111,47 @@ export const StudioDependencyTree: React.FC<StudioDependencyTreeProps> = ({ venv
         <Layers size={48} className="mx-auto text-red-400 mb-4 opacity-50"/>
         <h3 className="text-sm font-black text-red-600 uppercase mb-2">Analysis Failed</h3>
         <p className="text-xs text-red-500 mb-6 font-medium">{error}</p>
-        {venv.manager_type === "pip" && (
+        {showMissingToolHelp && (
           <div className="p-4 bg-white dark:bg-slate-900 rounded-2xl text-left border border-red-100 dark:border-red-900/20 shadow-sm">
             <p className="text-[10px] font-bold text-slate-500 uppercase mb-2 flex items-center gap-2"><Info size={12}/> Missing Tool:</p>
             <code className="text-[10px] font-mono text-blue-600 dark:text-blue-400 block p-2 bg-slate-50 dark:bg-slate-950 rounded-lg">
               pip install pipdeptree
             </code>
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={async () => {
+                  setInstallingTool(true);
+                  try {
+                    await packageService.install(venv, "pipdeptree");
+                    await fetchTree(true);
+                  } catch (installErr: any) {
+                    setError(installErr?.toString?.() || "Failed to install pipdeptree.");
+                  } finally {
+                    setInstallingTool(false);
+                  }
+                }}
+                disabled={installingTool || openingTerminal}
+                className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-[10px] font-black uppercase disabled:opacity-50"
+              >
+                {installingTool ? "Installing..." : "Install Now"}
+              </button>
+              <button
+                onClick={async () => {
+                  setOpeningTerminal(true);
+                  try {
+                    await invoke("open_terminal_with_venv_command", { path: venv.path, command: "pip install pipdeptree" });
+                  } catch (openErr: any) {
+                    setError(openErr?.toString?.() || "Failed to open terminal with command.");
+                  } finally {
+                    setOpeningTerminal(false);
+                  }
+                }}
+                disabled={openingTerminal || installingTool}
+                className="px-3 py-1.5 rounded-lg bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-[10px] font-black uppercase disabled:opacity-50"
+              >
+                {openingTerminal ? "Opening..." : "Open Install Command"}
+              </button>
+            </div>
           </div>
         )}
       </div>
