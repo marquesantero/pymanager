@@ -180,6 +180,7 @@ struct JobSnapshot {
     status: String,
     result: Option<serde_json::Value>,
     error: Option<String>,
+    finished_at_ms: Option<u64>,
 }
 
 impl JobSnapshot {
@@ -188,6 +189,7 @@ impl JobSnapshot {
             status: "running".to_string(),
             result: None,
             error: None,
+            finished_at_ms: None,
         }
     }
 }
@@ -199,6 +201,7 @@ struct AppState {
 }
 
 fn create_background_job(state: &tauri::State<'_, AppState>) -> Result<(String, BackgroundJobHandle), String> {
+    cleanup_finished_jobs(state, 10 * 60 * 1000)?;
     let job_id = format!("job-{}", state.job_seq.fetch_add(1, Ordering::Relaxed) + 1);
     let handle = BackgroundJobHandle {
         cancel: Arc::new(AtomicBool::new(false)),
@@ -214,7 +217,37 @@ fn set_job_status(handle: &BackgroundJobHandle, status: &str, result: Option<ser
         snapshot.status = status.to_string();
         snapshot.result = result;
         snapshot.error = error;
+        snapshot.finished_at_ms = match status {
+            "success" | "error" | "cancelled" => Some(now_ms()),
+            _ => None,
+        };
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn cleanup_finished_jobs(state: &tauri::State<'_, AppState>, keep_ms: u64) -> Result<(), String> {
+    let mut jobs = state.jobs.lock().map_err(|_| "Failed to lock job store".to_string())?;
+    let cutoff = now_ms().saturating_sub(keep_ms);
+    let mut to_remove = Vec::new();
+    for (job_id, handle) in jobs.iter() {
+        if let Ok(snapshot) = handle.snapshot.lock() {
+            if let Some(done_at) = snapshot.finished_at_ms {
+                if done_at <= cutoff {
+                    to_remove.push(job_id.clone());
+                }
+            }
+        }
+    }
+    for job_id in to_remove {
+        jobs.remove(&job_id);
+    }
+    Ok(())
 }
 
 fn run_command_with_timeout_and_cancel(command: &mut Command, timeout_secs: u64, cancel: &AtomicBool) -> Result<Output, String> {
@@ -618,6 +651,7 @@ fn start_security_audit_job(venv_path: String, state: tauri::State<'_, AppState>
 
 #[tauri::command]
 fn get_background_job(job_id: String, state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    cleanup_finished_jobs(&state, 10 * 60 * 1000)?;
     let handle = {
         let jobs = state.jobs.lock().map_err(|_| "Failed to lock job store".to_string())?;
         jobs.get(&job_id).cloned()

@@ -12,7 +12,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { VenvInfo } from '../../types';
 import { packageService } from '../../services/packageManager';
-import { Loader2, Layers } from 'lucide-react';
+import { Loader2, Layers, RefreshCcw } from 'lucide-react';
 
 interface StudioDependencyGraphProps {
   venv: VenvInfo;
@@ -86,22 +86,23 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
     setEdges(newEdges);
   };
 
+  const fetchData = async (force = false) => {
+    setLoading(true);
+    try {
+      const tree = await packageService.getDependencyTree(venv, { force });
+      const data = Array.isArray(tree) ? tree : [tree];
+      setFullData(data);
+      buildGraph(data, maxDepth);
+    } catch (err) {
+      console.error("Graph Error:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      try {
-        const tree = await packageService.getDependencyTree(venv);
-        const data = Array.isArray(tree) ? tree : [tree];
-        setFullData(data);
-        buildGraph(data, maxDepth);
-      } catch (err) {
-        console.error("Graph Error:", err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchData();
-  }, [venv]);
+    fetchData(false);
+  }, [venv.path, venv.manager_type]);
 
   useEffect(() => {
     if (fullData.length > 0) {
@@ -124,6 +125,13 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
         <div className="flex items-center gap-3">
             <div className="p-2 bg-blue-600 text-white rounded-lg"><Layers size={14}/></div>
             <p className="text-[10px] font-black uppercase tracking-widest">Scan Depth Control</p>
+            <button
+              onClick={() => fetchData(true)}
+              className="flex items-center gap-1 text-[9px] font-black uppercase tracking-wide text-blue-600 hover:underline"
+            >
+              <RefreshCcw size={12} />
+              Refresh
+            </button>
         </div>
         <div className="flex bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
             {[1, 2, 3].map(d => (
