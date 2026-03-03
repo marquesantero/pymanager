@@ -1,5 +1,6 @@
 import { Dispatch, MutableRefObject, SetStateAction, useCallback, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import { dbService } from "../services/db";
 import { ManagerStatus, Script, StudioTabId, Template, ThemeMode, VenvDetails, VenvInfo } from "../types";
 
@@ -42,25 +43,42 @@ export function useAppInitialization({
           if (!cancelled) setActiveWorkspace(def.path);
         }
 
+      } catch (err) {
+        console.error("BOOT ERR [workspaces]:", err);
+      }
+
+      try {
         const cache = await dbService.getCachedVenvs();
         if (!cancelled) setVenvCache(cache);
+      } catch (err) {
+        console.error("BOOT ERR [cache]:", err);
+      }
 
+      try {
         const py = await invoke<string[]>("list_system_pythons");
         if (!cancelled) {
           setSystemPythons(py);
           if (py.length > 0) setSelectedPython(py[0].split("|")[0]);
         }
+      } catch (err) {
+        console.error("BOOT ERR [python]:", err);
+      }
 
+      try {
         const templates = await dbService.getCustomTemplates();
         if (!cancelled) setCustomTemplates(templates);
+      } catch (err) {
+        console.error("BOOT ERR [templates]:", err);
+      }
 
+      try {
         const mgrs = await invoke<ManagerStatus>("check_managers");
         if (!cancelled && mgrs) {
           setAvailableManagers(mgrs);
           if (mgrs.uv) setSelectedEngine("uv");
         }
       } catch (err) {
-        console.error("BOOT ERR:", err);
+        console.error("BOOT ERR [managers]:", err);
       } finally {
         if (!cancelled) setIsInitialLoading(false);
       }
@@ -111,8 +129,21 @@ export function useThemeAndZoom(theme: ThemeMode, zoomLevel: number) {
   useEffect(() => {
     const root = document.getElementById("root-container");
     if (root) {
-      root.style.zoom = `${zoomLevel}%`;
+      const scale = Math.max(0.5, zoomLevel / 100);
+      root.style.transformOrigin = "top left";
+      root.style.transform = `scale(${scale})`;
+      root.style.width = `${100 / scale}%`;
+      root.style.height = `${100 / scale}%`;
     }
+
+    return () => {
+      const rootEl = document.getElementById("root-container");
+      if (!rootEl) return;
+      rootEl.style.transform = "";
+      rootEl.style.transformOrigin = "";
+      rootEl.style.width = "";
+      rootEl.style.height = "";
+    };
   }, [zoomLevel]);
 }
 
@@ -164,6 +195,110 @@ export function useWorkspaceOperations({
   }, [setSyncingVenv, setVenvCache]);
 
   return { scanWorkspace, syncSingleVenv };
+}
+
+interface WorkspaceCrudActionsConfig {
+  workspaces: { path: string; is_default: boolean }[];
+  setWorkspaces: StateSetter<{ path: string; is_default: boolean }[]>;
+  setActiveWorkspace: StateSetter<string>;
+  setMessage: (msg: string) => void;
+  scanWorkspace: (workspacePath: string) => Promise<void>;
+}
+
+export function useWorkspaceCrudActions({
+  workspaces,
+  setWorkspaces,
+  setActiveWorkspace,
+  setMessage,
+  scanWorkspace
+}: WorkspaceCrudActionsConfig) {
+  const addWorkspace = useCallback(async () => {
+    const selected = await open({ directory: true });
+    if (!selected) return;
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    if (workspaces.some((w) => w.path === path)) return;
+
+    await dbService.addWorkspace(path);
+    setWorkspaces((prev) => (prev.some((w) => w.path === path) ? prev : [...prev, { path, is_default: false }]));
+    setActiveWorkspace(path);
+    await scanWorkspace(path);
+  }, [workspaces, setWorkspaces, setActiveWorkspace, scanWorkspace]);
+
+  const removeWorkspace = useCallback(async (workspacePath: string) => {
+    if (!(await ask(`Remove ${workspacePath}?`))) return;
+    await dbService.removeWorkspace(workspacePath);
+    setWorkspaces((prev) => prev.filter((w) => w.path !== workspacePath));
+    setActiveWorkspace((prev) => (prev === workspacePath ? "" : prev));
+  }, [setWorkspaces, setActiveWorkspace]);
+
+  const setDefaultWorkspace = useCallback(async (workspacePath: string) => {
+    await dbService.setDefaultWorkspace(workspacePath);
+    setWorkspaces((prev) => prev.map((w) => ({ ...w, is_default: w.path === workspacePath })));
+    setMessage("Default workspace updated.");
+  }, [setWorkspaces, setMessage]);
+
+  return { addWorkspace, removeWorkspace, setDefaultWorkspace };
+}
+
+interface VenvCreationConfig {
+  activeWorkspace: string;
+  newVenvName: string;
+  selectedPython: string;
+  selectedEngine: "pip" | "uv";
+  selectedTemplate: Template;
+  setLoading: StateSetter<boolean>;
+  setNewVenvName: StateSetter<string>;
+  setMessage: (msg: string) => void;
+  scanWorkspace: (workspacePath: string) => Promise<void>;
+}
+
+interface VenvSetupResult {
+  venv_path: string;
+  installed: string[];
+}
+
+export function useVenvCreation({
+  activeWorkspace,
+  newVenvName,
+  selectedPython,
+  selectedEngine,
+  selectedTemplate,
+  setLoading,
+  setNewVenvName,
+  setMessage,
+  scanWorkspace
+}: VenvCreationConfig) {
+  return useCallback(async () => {
+    if (!newVenvName || !activeWorkspace) return;
+    setLoading(true);
+    setMessage(`Building ${newVenvName}...`);
+    try {
+      const result = await invoke<VenvSetupResult>("create_venv_with_template", {
+        path: activeWorkspace,
+        name: newVenvName,
+        pythonBin: selectedPython,
+        engine: selectedEngine,
+        packages: selectedTemplate.pkgs
+      });
+      setNewVenvName("");
+      await scanWorkspace(activeWorkspace);
+      setMessage(`Built ${result.venv_path} (${result.installed.length} packages).`);
+    } catch (err) {
+      setMessage(`Error: ${err}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [
+    newVenvName,
+    activeWorkspace,
+    selectedPython,
+    selectedEngine,
+    selectedTemplate,
+    setLoading,
+    setNewVenvName,
+    setMessage,
+    scanWorkspace
+  ]);
 }
 
 interface StudioLoaderConfig {

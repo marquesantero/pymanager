@@ -36,6 +36,12 @@ pub struct OutdatedPackage {
     latest_version: String,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct VenvSetupResult {
+    venv_path: String,
+    installed: Vec<String>,
+}
+
 // --- Internal Helpers ---
 
 fn get_pip_path(venv_path: &Path) -> PathBuf {
@@ -856,8 +862,7 @@ fn get_manager_path(cmd: &str) -> String {
     cmd.to_string()
 }
 
-#[tauri::command]
-fn create_venv(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
+fn create_venv_internal(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
     let root = canonicalize_dir(&path)?;
     let mut full_path = root;
     full_path.push(&name);
@@ -867,17 +872,86 @@ fn create_venv(path: String, name: String, python_bin: String, engine: String) -
         let uv_path = get_manager_path("uv");
         let mut cmd = Command::new(uv_path);
         cmd.args(["venv", target_path]);
-        if !python_bin.is_empty() { cmd.arg("--python").arg(&python_bin); }
+        if !python_bin.is_empty() {
+            cmd.arg("--python").arg(&python_bin);
+        }
         let output = cmd.output().map_err(|e| e.to_string())?;
-        if output.status.success() { return Ok(format!("Created with uv: {}", name)); }
-        else { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
+        if output.status.success() {
+            return Ok(target_path.to_string());
+        } else {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
     }
-    // ...
 
-    let bin = if python_bin.is_empty() { "python3".to_string() } else { python_bin };
-    let output = Command::new(bin).args(["-m", "venv", target_path]).output().map_err(|e| e.to_string())?;
-    if output.status.success() { Ok(format!("Created with venv: {}", name)) } 
-    else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+    let bin = if python_bin.is_empty() {
+        "python3".to_string()
+    } else {
+        python_bin
+    };
+    let output = Command::new(bin)
+        .args(["-m", "venv", target_path])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(target_path.to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+fn install_dependency_internal(venv_path: String, package: String, engine: String) -> Result<String, String> {
+    let venv = ensure_venv_dir(&venv_path)?;
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let python_path = get_python_path(&venv);
+        let output = Command::new(uv_path)
+            .args(["pip", "install", "--python", python_path.to_str().unwrap(), &package])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            return Ok(format!("uv installed {}", package));
+        } else {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+    }
+
+    let p = get_pip_path(&venv);
+    let output = Command::new(p)
+        .args(["install", &package])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(format!("Installed {}", package))
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+fn create_venv(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
+    create_venv_internal(path, name.clone(), python_bin, engine)?;
+    Ok(format!("Created {}", name))
+}
+
+#[tauri::command]
+async fn create_venv_with_template(
+    path: String,
+    name: String,
+    python_bin: String,
+    engine: String,
+    packages: Vec<String>,
+) -> Result<VenvSetupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv_path = create_venv_internal(path, name, python_bin, engine.clone())?;
+        let mut installed = Vec::new();
+        for pkg in packages {
+            install_dependency_internal(venv_path.clone(), pkg.clone(), engine.clone())?;
+            installed.push(pkg);
+        }
+        Ok(VenvSetupResult { venv_path, installed })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -893,20 +967,7 @@ fn delete_venv(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn install_dependency(venv_path: String, package: String, engine: String) -> Result<String, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    if engine == "uv" {
-        let uv_path = get_manager_path("uv");
-        let python_path = get_python_path(&venv);
-        let output = Command::new(uv_path)
-            .args(["pip", "install", "--python", python_path.to_str().unwrap(), &package])
-            .output().map_err(|e| e.to_string())?;
-        if output.status.success() { return Ok(format!("uv installed {}", package)); }
-        else { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
-    }
-
-    let p = get_pip_path(&venv);
-    let output = Command::new(p).args(["install", &package]).output().map_err(|e| e.to_string())?;
-    if output.status.success() { Ok(format!("Installed {}", package)) } else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+    install_dependency_internal(venv_path, package, engine)
 }
 
 #[tauri::command]
@@ -1010,7 +1071,7 @@ pub fn run() {
             start_diagnostics_job, start_security_audit_job, get_background_job, cancel_background_job,
             get_package_sizes, generate_docker_files, check_managers, audit_environments, get_dependency_tree, audit_security,
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
-            open_terminal, open_in_vscode, create_venv, list_venvs, delete_venv, 
+            open_terminal, open_in_vscode, create_venv, create_venv_with_template, list_venvs, delete_venv, 
             install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,
             export_requirements, get_pyvenv_cfg, search_pypi
         ])

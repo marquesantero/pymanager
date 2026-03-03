@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { open, ask } from "@tauri-apps/plugin-dialog";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { Terminal, RefreshCcw, Box, Loader2, Package, X, Code2, BookmarkPlus, Globe, Settings, ExternalLink, Trash2 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
@@ -14,6 +14,8 @@ import {
   useGlobalSearchShortcut,
   useStudioLoader,
   useThemeAndZoom,
+  useVenvCreation,
+  useWorkspaceCrudActions,
   useWorkspaceOperations
 } from "./hooks/useAppController";
 import { useToastMessages } from "./hooks/useToastMessages";
@@ -77,6 +79,24 @@ export default function App() {
     setMessage,
     setVenvCache
   });
+  const { addWorkspace, removeWorkspace, setDefaultWorkspace } = useWorkspaceCrudActions({
+    workspaces,
+    setWorkspaces,
+    setActiveWorkspace,
+    setMessage,
+    scanWorkspace
+  });
+  const handleCreateVenv = useVenvCreation({
+    activeWorkspace,
+    newVenvName,
+    selectedPython,
+    selectedEngine,
+    selectedTemplate,
+    setLoading,
+    setNewVenvName,
+    setMessage,
+    scanWorkspace
+  });
   const openStudio = useStudioLoader({
     mountedRef,
     setSelectedVenv,
@@ -132,31 +152,9 @@ export default function App() {
         theme={theme} setTheme={setTheme} workspaces={workspaces} activeWorkspace={activeWorkspace}
         setActiveWorkspace={setActiveWorkspace} scanWorkspace={scanWorkspace}
         openHygiene={() => setIsHygieneOpen(true)}
-        addWorkspace={async () => {
-          const s = await open({ directory: true });
-          if (s) {
-            const p = Array.isArray(s) ? s[0] : s;
-            if (workspaces.some(w => w.path === p)) return;
-            await dbService.addWorkspace(p);
-            setWorkspaces(prev => (
-              prev.some(w => w.path === p) ? prev : [...prev, { path: p, is_default: false }]
-            ));
-            setActiveWorkspace(p);
-            scanWorkspace(p);
-          }
-        }}
-        removeWorkspace={async (wsPath) => {
-          if (await ask(`Remove ${wsPath}?`)) {
-            await dbService.removeWorkspace(wsPath);
-            setWorkspaces(prev => prev.filter(w => w.path !== wsPath));
-            setActiveWorkspace(prev => prev === wsPath ? "" : prev);
-          }
-        }}
-        setDefaultWorkspace={async (wsPath) => {
-          await dbService.setDefaultWorkspace(wsPath);
-          setWorkspaces(prev => prev.map(w => ({ ...w, is_default: w.path === wsPath })));
-          setMessage("Default workspace updated.");
-        }}
+        addWorkspace={addWorkspace}
+        removeWorkspace={removeWorkspace}
+        setDefaultWorkspace={setDefaultWorkspace}
       />
 
       <main className="flex-1 flex flex-col relative overflow-hidden">
@@ -191,22 +189,7 @@ export default function App() {
 
             <select value={selectedPython} onChange={(e) => setSelectedPython(e.target.value)} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs text-blue-600">{systemPythons.map(p => <option key={p.split('|')[0]} value={p.split('|')[0]}>{p.split('|')[1]}</option>)}</select>
             <select value={selectedTemplate.id} onChange={(e) => setSelectedTemplate([...PYTHON_TEMPLATES, ...customTemplates].find(t => t.id === e.target.value) || PYTHON_TEMPLATES[0])} className="bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 rounded-md px-2 py-1 text-xs">{[...PYTHON_TEMPLATES, ...customTemplates].map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select>
-            <button onClick={async () => {
-              if (!newVenvName || !activeWorkspace) return;
-              setLoading(true);
-              try {
-                await invoke("create_venv", { path: activeWorkspace, name: newVenvName, pythonBin: selectedPython, engine: selectedEngine });
-                for (const pkg of selectedTemplate.pkgs) {
-                  await invoke("install_dependency", { venvPath: `${activeWorkspace}/${newVenvName}`, package: pkg, engine: selectedEngine });
-                }
-                setNewVenvName("");
-                scanWorkspace(activeWorkspace);
-              } catch (e) {
-                setMessage(`Error: ${e}`);
-              } finally {
-                setLoading(false);
-              }
-            }} disabled={loading || !newVenvName} className="bg-blue-600 text-white px-4 py-1 rounded-md text-[10px] font-black uppercase shadow-sm active:scale-95 transition-all">{loading ? <Loader2 size={10} className="animate-spin" /> : "Build"}</button>
+            <button onClick={handleCreateVenv} disabled={loading || !newVenvName} className="bg-blue-600 text-white px-4 py-1 rounded-md text-[10px] font-black uppercase shadow-sm active:scale-95 transition-all">{loading ? <Loader2 size={10} className="animate-spin" /> : "Build"}</button>
             {statusText && <p className="text-[9px] font-black text-blue-500 truncate ml-auto uppercase">{statusText}</p>}
           </div>
           {selectedPython && <p className="text-[9px] text-slate-400 font-mono ml-[52px] truncate opacity-70">Binary: {selectedPython}</p>}
