@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { ToastMessage } from "../types";
 
 export function useToastMessages() {
@@ -7,10 +7,11 @@ export function useToastMessages() {
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
-  const pushMessage = (text: string) => {
+  const pushMessage = useCallback((text: string) => {
     const tone: ToastMessage["tone"] = text.toLowerCase().includes("error") ? "error" : "success";
     const toast = { id: Date.now() + Math.floor(Math.random() * 1000), text, tone };
     setStatusText(text);
@@ -19,7 +20,7 @@ export function useToastMessages() {
       if (!mountedRef.current) return;
       setToasts(prev => prev.filter(t => t.id !== toast.id));
     }, 3500);
-  };
+  }, []);
 
   return { statusText, toasts, pushMessage, mountedRef };
 }

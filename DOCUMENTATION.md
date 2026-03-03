@@ -1,86 +1,142 @@
-# Documentação Técnica - PyManager 🐍
+# Documentacao Tecnica - PyManager Orchestrator
 
-PyManager é um gerenciador de ambientes virtuais Python de alto nível, projetado para desenvolvedores que lidam com múltiplos projetos e desejam evitar o "inferno dos venvs". Ele combina a performance do **Rust** com a flexibilidade do **React 19** e **Tauri v2**.
+## Visao Geral
+PyManager e um aplicativo desktop (Tauri v2) para descoberta, criacao, auditoria e manutencao de ambientes virtuais Python. A aplicacao combina:
+- Frontend: React 19 + TypeScript + Tailwind CSS v4
+- Backend: Rust (comandos Tauri)
+- Persistencia local: SQLite via `tauri-plugin-sql`
 
----
+Objetivo principal: centralizar o ciclo de vida de venvs (pip/uv), com cache local, diagnostico e ferramentas visuais de dependencias.
 
-## 🏗️ Arquitetura do Sistema
+## Arquitetura
 
-### Backend (Rust/Tauri)
-- **Descoberta Dinâmica:** Utiliza o `PATH` do sistema para localizar executáveis Python sem caminhos fixos.
-- **Segurança:** Comandos isolados para manipulação de arquivos e execução de scripts.
-- **Persistência:** Base de dados **SQLite** (`py-manager.db`) integrada via plugin SQL do Tauri.
-- **Análise de Disco:** Cálculo de tamanho de diretórios utilizando a crate `fs_extra`.
+### Camada Frontend (`src/`)
+- `App.tsx`: estado global, fluxo principal, abertura de modais e orquestracao de chamadas `invoke`.
+- `components/Sidebar.tsx`: workspaces, tema, higiene global.
+- `components/HygieneOverlay.tsx`: auditoria entre DB e disco (prune/adopt).
+- `components/CommandPalette.tsx`: busca global (`Ctrl/Cmd + K`).
+- `components/Studio/*`: modulo por ambiente (pacotes, automacao, config, diagnostico e deploy).
+- `services/db.ts`: acesso SQLite no frontend (cache e metadados).
+- `services/packageManager.ts`: facade de operacoes de pacote orientadas ao `manager_type`.
 
-### Frontend (React/TypeScript)
-- **Modularização:** Componentes especializados na pasta `src/components/Studio` para cada funcionalidade.
-- **Estilização:** Tailwind CSS v4 com design "Flat" e suporte nativo a Dark Mode.
-- **Escala Global:** Sistema de zoom baseado em CSS para acessibilidade total.
+### Camada Backend (`src-tauri/src/lib.rs`)
+Responsavel por:
+- Descobrir venvs no filesystem (WalkDir com filtros)
+- Executar comandos de pacote (`pip`, `uv`, `pipdeptree`, `pip-audit`)
+- Coletar dados de diagnostico (health, outdated, security)
+- Operacoes utilitarias (abrir terminal, VS Code, gerar Dockerfile, exportar requirements)
+- Migracoes do banco local
 
----
+### Persistencia (SQLite)
+Banco: `py-manager.db`.
 
-## 🛠️ Funcionalidades Detalhadas
+Tabelas criadas por migracao:
+1. `workspaces` (`path`, `is_default`)
+2. `venvs` (`workspace_path`, `name`, `path`, `version`, `status`, `issue`, `last_modified`, `manager_type`, `pyproject_path`)
+3. `scripts` (`venv_path`, `name`, `command`)
+4. `custom_templates` (`name`, `packages` JSON serializado)
 
-### 1. Gestão de Workspaces
-- **Adição Dinâmica:** Permite selecionar qualquer pasta no disco para monitoramento.
-- **Scan Recursivo:** O motor de busca ignora pastas pesadas (`node_modules`, `target`, `.git`) e localiza ambientes `.venv` ou com nomes customizados.
-- **Persistência de Cache:** Os resultados do scan são salvos no SQLite para carregamento instantâneo no próximo boot.
+## Fluxo de Inicializacao
+No boot da aplicacao (`App.tsx`):
+1. Carrega workspaces salvos e define o workspace padrao.
+2. Carrega cache de venvs do SQLite.
+3. Descobre interpretes Python disponiveis no PATH.
+4. Carrega templates customizados.
+5. Detecta managers instalados (`uv`, `poetry`, `pdm`) e prioriza `uv` quando disponivel.
 
-### 2. Python Dev Studio (O Core)
-Uma interface de sobreposição (Overlay) completa para cada ambiente selecionado:
+## Funcionalidades Implementadas
 
-#### **A. Packages (Gerenciador de Bibliotecas)**
-- **Visualização de Versões:** Lista todas as bibliotecas instaladas (`pip freeze`).
-- **Explorador de Tamanho:** Mostra o impacto real em **Megabytes (MB)** de cada pacote individual no disco.
-- **Ações Rápidas:** Botões para atualizar (`upgrade`) ou desinstalar (`uninstall`) bibliotecas com um clique.
-- **Exportação:** Gera o arquivo `requirements.txt` na raiz do projeto automaticamente.
+### 1. Workspaces e descoberta
+- Adicionar/remover workspace.
+- Definir workspace padrao.
+- Scan recursivo de venvs via `list_venvs`.
+- Cache local por workspace para carregamento rapido.
 
-#### **B. Automation (Scripts Customizados)**
-- **Runner Interno:** Permite salvar comandos Python frequentes (ex: `import database; database.setup()`).
-- **Execução em Contexto:** Os scripts rodam utilizando o interpretador exato do ambiente virtual selecionado.
-- **Histórico:** Salva os scripts no banco de dados para uso recorrente entre sessões.
+### 2. Criacao de ambientes
+- Escolha de engine: `pip` ou `uv` (quando detectado).
+- Escolha do binario Python.
+- Aplicacao automatica de template de pacotes apos criar o ambiente.
 
-#### **C. Config (Editor de Configuração)**
-- **.env Editor:** Interface lado a lado para editar variáveis de ambiente do projeto.
-- **pyvenv.cfg Viewer:** Visualizador em modo leitura das configurações nativas do Python (caminho base, versão, etc).
+### 3. Cards de ambiente
+Acoes por ambiente:
+- Sync individual (`scan_venv`)
+- Abrir no VS Code
+- Abrir terminal no diretorio
+- Abrir Studio
+- Excluir ambiente fisicamente (`delete_venv`)
 
-#### **D. Diagnostics (Saúde do Ambiente)**
-- **Integridade:** Executa o `pip check` para encontrar conflitos de dependências.
-- **Detector de Desatualização:** Compara as versões instaladas com as mais recentes no PyPI e sugere atualizações.
+### 4. Studio (overlay por ambiente)
+#### Packages
+- Coleta de `pip freeze` + tamanho total
+- Estimativa de tamanho por pacote
+- Atualizar/desinstalar pacote
+- Exportar `requirements.txt` no diretorio pai do venv
+- Visualizacoes: lista, arvore de dependencias, grafo interativo (React Flow)
 
-#### **E. Deploy (Docker Engine)**
-- **Docker Generator:** Analisa a versão do Python e os pacotes instalados para gerar um `Dockerfile` otimizado (slim) e um `docker-compose.yml` prontos para uso.
+#### Automation
+- Persistir scripts Python por ambiente
+- Executar script com `python -c` do proprio venv
 
-### 3. Sistema de Templates Customizados
-- **Snapshot de Ambiente:** Salve o estado de qualquer ambiente atual (lista de pacotes) como um template.
-- **Bootstrap Rápido:** Ao criar um novo ambiente, selecione um template para que o PyManager instale todas as dependências automaticamente durante o build.
+#### Config
+- Edicao de `.env` no diretorio pai do venv
+- Leitura de `pyvenv.cfg` (somente leitura)
 
-### 4. Interface e Acessibilidade
-- **Global Zoom (A+/A-):** Redimensiona proporcionalmente todos os elementos da interface (textos, ícones, inputs) de 70% a 150%.
-- **Theming:** Troca rápida entre modo Claro, Escuro ou Sincronização com o Sistema.
-- **Loading Premium:** Animação de inicialização que previne o flickering de cores durante a carga dos dados do SQLite.
+#### Diagnostics
+- Consistencia via `pip check`
+- Pacotes desatualizados via `pip list --outdated --format=json`
+- Security audit via `python -m pip_audit --format json`
 
----
+#### Deploy
+- Gera `Dockerfile` e `docker-compose.yml` em memoria para copia
 
-## 🚀 Comandos Rápidos
+### 5. Higiene global
+Auditoria cruzada DB x disco:
+- `broken_links`: entradas no banco sem pasta fisica
+- `untracked_venvs`: venvs no disco sem registro no banco
 
-| Ação | Atalho no Card |
-| :--- | :--- |
-| **Sync** | Atualiza status e versão do venv individualmente |
-| **Terminal** | Abre o terminal nativo do SO já na pasta do projeto |
-| **VS Code** | Abre o ambiente diretamente no Visual Studio Code |
-| **Studio** | Abre a central de ferramentas avançadas |
-| **Delete** | Remove a pasta do ambiente do disco físico |
+Acoes:
+- `Prune`: remove entrada morta no DB
+- `Adopt`: adiciona venv orfa ao workspace correspondente
 
----
+## Comandos Tauri Disponiveis
+Principais comandos expostos:
+- Descoberta/gestao: `list_venvs`, `scan_venv`, `create_venv`, `delete_venv`
+- Pacotes: `install_dependency`, `uninstall_package`, `update_package`, `get_dependency_tree`, `get_package_sizes`
+- Diagnostico: `check_venv_health`, `list_outdated_packages`, `audit_security`
+- Config/arquivos: `read_env_file`, `save_env_file`, `get_pyvenv_cfg`, `export_requirements`
+- Integracoes locais: `open_terminal`, `open_in_vscode`
+- Suporte: `list_system_pythons`, `check_managers`, `audit_environments`, `generate_docker_files`, `search_pypi`
 
-## 📝 Banco de Dados (Schema)
+## Dependencias Externas Relevantes
+- Obrigatorias para uso base:
+  - Python 3.x
+  - Node.js 20+
+  - Rust 1.85+
+- Recomendadas/condicionais:
+  - `uv` para criacao/instalacao acelerada
+  - `pipdeptree` para arvore de dependencia de ambientes `pip`
+  - `pip-audit` para auditoria de seguranca
+  - VS Code CLI (`code`) para acao "Open in VS Code"
 
-O PyManager utiliza 4 tabelas principais:
-1. `workspaces`: Armazena os caminhos das pastas monitoradas.
-2. `venvs`: Cache de metadados (nome, caminho, versão, status).
-3. `scripts`: Scripts de automação vinculados a cada caminho de venv.
-4. `custom_templates`: Nome do template e string serializada de pacotes.
+## Limitacoes Observadas
+1. `search_pypi` existe no backend, mas nao esta ligado a UI atual.
+2. O resultado da seguranca depende de `pip-audit` instalado dentro do ambiente analisado.
+3. O grafo de dependencia profundo pode ficar pesado em ambientes grandes (ha controle de profundidade para mitigar).
+4. Geracao Docker e preview/copia em UI; nao grava arquivos automaticamente no projeto.
 
----
-*PyManager - Desenvolvido para máxima produtividade em Python.*
+## Mapa de Arquivos
+- Frontend:
+  - `src/App.tsx`
+  - `src/components/**`
+  - `src/services/db.ts`
+  - `src/services/packageManager.ts`
+- Backend:
+  - `src-tauri/src/lib.rs`
+  - `src-tauri/Cargo.toml`
+  - `src-tauri/tauri.conf.json`
+
+## Sugestoes Tecnicas (proximos passos)
+1. Conectar `search_pypi` a uma UX de busca/instalacao de pacote.
+2. Permitir salvar Docker manifests diretamente no projeto.
+3. Adicionar suite de testes (unitarios Rust + testes de componentes React).
+4. Normalizar nomenclatura de produto em `tauri.conf.json` (`productName`, `title`) para refletir "PyManager".

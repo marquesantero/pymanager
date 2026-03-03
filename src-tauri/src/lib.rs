@@ -4,8 +4,14 @@ use serde::{Serialize, Deserialize};
 use std::fs;
 use std::time::UNIX_EPOCH;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+use std::thread;
+use std::process::{Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use walkdir::WalkDir;
 use tauri_plugin_sql::{Migration, MigrationKind};
+const ENGINE_MARKER_FILE: &str = ".pymanager-engine";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct VenvInfo {
@@ -29,6 +35,18 @@ pub struct OutdatedPackage {
     name: String,
     version: String,
     latest_version: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct VenvSetupResult {
+    venv_path: String,
+    installed: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DependencyTreePrereq {
+    ok: bool,
+    message: Option<String>,
 }
 
 // --- Internal Helpers ---
@@ -98,11 +116,7 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
                 _ => { status = "Broken".to_string(); issue = Some("Interpreter corrupted".to_string()); }
             }
         }
-        let manager_type = if p.join("uv.lock").exists() || p.parent().map_or(false, |parent| parent.join("uv.lock").exists()) {
-            "uv".to_string()
-        } else {
-            "pip".to_string()
-        };
+        let manager_type = detect_manager_type(p);
 
         return Some(VenvInfo { 
             name: p.file_name().unwrap_or_default().to_string_lossy().to_string(), 
@@ -117,57 +131,368 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
     None
 }
 
+fn detect_manager_type(venv_path: &Path) -> String {
+    let marker = venv_path.join(ENGINE_MARKER_FILE);
+    if let Ok(raw) = fs::read_to_string(&marker) {
+        let value = raw.trim().to_lowercase();
+        if value == "uv" || value == "pip" {
+            return value;
+        }
+    }
+
+    // uv-created venvs write "uv = <version>" into pyvenv.cfg.
+    let cfg_path = venv_path.join("pyvenv.cfg");
+    if let Ok(cfg) = fs::read_to_string(cfg_path) {
+        if cfg.lines().any(|line| line.trim_start().starts_with("uv =")) {
+            return "uv".to_string();
+        }
+    }
+
+    if venv_path.join("uv.lock").exists() || venv_path.parent().map_or(false, |parent| parent.join("uv.lock").exists()) {
+        return "uv".to_string();
+    }
+
+    "pip".to_string()
+}
+
+fn persist_engine_marker(venv_path: &Path, engine: &str) {
+    let marker = venv_path.join(ENGINE_MARKER_FILE);
+    let _ = fs::write(marker, engine);
+}
+
+fn uv_cache_dir_for(base: &Path) -> String {
+    base.join(".uv-cache").to_string_lossy().to_string()
+}
+
+fn list_installed_packages(venv: &Path) -> Result<Vec<String>, String> {
+    let python = get_python_path(venv);
+    let script = r#"import importlib.metadata as m
+pkgs = []
+for d in m.distributions():
+    name = d.metadata.get("Name") or d.metadata.get("name") or d.name
+    if name:
+        pkgs.append(f"{name}=={d.version}")
+for line in sorted(set(pkgs), key=lambda s: s.lower()):
+    print(line)
+"#;
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", script]);
+    let output = run_command_with_timeout(&mut cmd, 120)?;
+    if !output.status.success() {
+        return Err(format!("Failed to list packages: {}", stdout_or_stderr(&output).trim()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect())
+}
+
+fn build_dependency_tree_with_python(venv: &Path) -> Result<serde_json::Value, String> {
+    let python = get_python_path(venv);
+    let script = r#"import json, re, importlib.metadata as m
+
+def norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+packages = {}
+deps = {}
+
+for dist in m.distributions():
+    name = dist.metadata.get("Name") or dist.metadata.get("name") or dist.name
+    if not name:
+        continue
+    key = norm(name)
+    packages[key] = {"name": name, "version": dist.version or "unknown"}
+    requires = []
+    for req in (dist.requires or []):
+        base = req.split(";", 1)[0].strip()
+        if not base:
+            continue
+        base = base.split("[", 1)[0].strip()
+        match = re.match(r"([A-Za-z0-9_.-]+)", base)
+        if match:
+            requires.append(norm(match.group(1)))
+    deps[key] = requires
+
+referenced = set()
+for children in deps.values():
+    for child in children:
+        if child in packages:
+            referenced.add(child)
+
+roots = sorted([k for k in packages.keys() if k not in referenced])
+if not roots:
+    roots = sorted(packages.keys())
+
+def build(node_key: str, stack):
+    info = packages[node_key]
+    if node_key in stack:
+        return {"package_name": info["name"], "installed_version": info["version"], "dependencies": []}
+
+    next_stack = set(stack)
+    next_stack.add(node_key)
+
+    children = []
+    for dep_key in deps.get(node_key, []):
+        if dep_key in packages:
+            children.append(build(dep_key, next_stack))
+    children.sort(key=lambda x: (x.get("package_name") or "").lower())
+
+    return {
+        "package_name": info["name"],
+        "installed_version": info["version"],
+        "dependencies": children,
+    }
+
+tree = [build(root, set()) for root in roots]
+print(json.dumps(tree))
+"#;
+    let mut cmd = Command::new(python);
+    cmd.args(["-c", script]);
+    let out = run_command_with_timeout(&mut cmd, 180)?;
+    if out.status.success() {
+        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+    } else {
+        Err(format!("Failed to build dependency tree: {}", stdout_or_stderr(&out).trim()))
+    }
+}
+
+fn parse_outdated_packages_json(raw: &[u8]) -> Result<Vec<OutdatedPackage>, String> {
+    let value: serde_json::Value = serde_json::from_slice(raw).map_err(|e| e.to_string())?;
+    let arr = value.as_array().ok_or_else(|| "Invalid outdated packages response format".to_string())?;
+    let mut items = Vec::with_capacity(arr.len());
+    for row in arr {
+        let name = row.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let version = row.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let latest_version = row
+            .get("latest_version")
+            .or_else(|| row.get("latest-version"))
+            .or_else(|| row.get("latest"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !name.is_empty() {
+            items.push(OutdatedPackage { name, version, latest_version });
+        }
+    }
+    Ok(items)
+}
+
+fn parse_security_audit_json_from_output(out: &Output) -> Result<serde_json::Value, String> {
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+fn safe_dir_size_mb(root: &Path, max_entries: usize) -> f64 {
+    let mut total_bytes: u64 = 0;
+    let mut seen: usize = 0;
+
+    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        if seen >= max_entries {
+            break;
+        }
+        seen += 1;
+        let p = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(p) {
+            if meta.file_type().is_file() {
+                total_bytes = total_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+
+    (total_bytes as f64) / 1024.0 / 1024.0
+}
+
+fn scan_max_depth() -> usize {
+    std::env::var("PYMANAGER_SCAN_MAX_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(3, 64))
+        .unwrap_or(16)
+}
+
+fn run_command_with_timeout(command: &mut Command, timeout_secs: u64) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let deadline = Duration::from_secs(timeout_secs);
+
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(_) => return child.wait_with_output().map_err(|e| e.to_string()),
+            None if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Command timed out after {} seconds", timeout_secs));
+            }
+            None => thread::sleep(Duration::from_millis(120)),
+        }
+    }
+}
+
+fn stdout_or_stderr(out: &Output) -> String {
+    if !out.stdout.is_empty() {
+        String::from_utf8_lossy(&out.stdout).to_string()
+    } else {
+        String::from_utf8_lossy(&out.stderr).to_string()
+    }
+}
+
+#[derive(Clone)]
+struct BackgroundJobHandle {
+    cancel: Arc<AtomicBool>,
+    snapshot: Arc<Mutex<JobSnapshot>>,
+}
+
+#[derive(Clone)]
+struct JobSnapshot {
+    status: String,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+    finished_at_ms: Option<u64>,
+}
+
+impl JobSnapshot {
+    fn running() -> Self {
+        Self {
+            status: "running".to_string(),
+            result: None,
+            error: None,
+            finished_at_ms: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct AppState {
+    jobs: Mutex<HashMap<String, BackgroundJobHandle>>,
+    job_seq: AtomicU64,
+}
+
+fn create_background_job(state: &tauri::State<'_, AppState>) -> Result<(String, BackgroundJobHandle), String> {
+    cleanup_finished_jobs(state, 10 * 60 * 1000)?;
+    let job_id = format!("job-{}", state.job_seq.fetch_add(1, Ordering::Relaxed) + 1);
+    let handle = BackgroundJobHandle {
+        cancel: Arc::new(AtomicBool::new(false)),
+        snapshot: Arc::new(Mutex::new(JobSnapshot::running())),
+    };
+    let mut jobs = state.jobs.lock().map_err(|_| "Failed to lock job store".to_string())?;
+    jobs.insert(job_id.clone(), handle.clone());
+    Ok((job_id, handle))
+}
+
+fn set_job_status(handle: &BackgroundJobHandle, status: &str, result: Option<serde_json::Value>, error: Option<String>) {
+    if let Ok(mut snapshot) = handle.snapshot.lock() {
+        snapshot.status = status.to_string();
+        snapshot.result = result;
+        snapshot.error = error;
+        snapshot.finished_at_ms = match status {
+            "success" | "error" | "cancelled" => Some(now_ms()),
+            _ => None,
+        };
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn cleanup_finished_jobs(state: &tauri::State<'_, AppState>, keep_ms: u64) -> Result<(), String> {
+    let mut jobs = state.jobs.lock().map_err(|_| "Failed to lock job store".to_string())?;
+    let cutoff = now_ms().saturating_sub(keep_ms);
+    let mut to_remove = Vec::new();
+    for (job_id, handle) in jobs.iter() {
+        if let Ok(snapshot) = handle.snapshot.lock() {
+            if let Some(done_at) = snapshot.finished_at_ms {
+                if done_at <= cutoff {
+                    to_remove.push(job_id.clone());
+                }
+            }
+        }
+    }
+    for job_id in to_remove {
+        jobs.remove(&job_id);
+    }
+    Ok(())
+}
+
+fn run_command_with_timeout_and_cancel(command: &mut Command, timeout_secs: u64, cancel: &AtomicBool) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let deadline = Duration::from_secs(timeout_secs);
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("Cancelled by user".to_string());
+        }
+
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(_) => return child.wait_with_output().map_err(|e| e.to_string()),
+            None if started.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Command timed out after {} seconds", timeout_secs));
+            }
+            None => thread::sleep(Duration::from_millis(120)),
+        }
+    }
+}
+
 // --- New Commands for Analysis ---
 
 #[tauri::command]
-fn get_package_sizes(venv_path: String) -> Result<HashMap<String, f64>, String> {
-    let mut sizes = HashMap::new();
-    let p = Path::new(&venv_path);
-    
-    // Find site-packages directory (logic varies by Python version/OS)
-    // On Linux usually: lib/python3.x/site-packages
-    #[cfg(not(windows))]
-    let lib_dir = p.join("lib");
-    #[cfg(windows)]
-    let lib_dir = p.join("Lib").join("site-packages");
+async fn get_package_sizes(venv_path: String) -> Result<HashMap<String, f64>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut sizes = HashMap::new();
+        let p = Path::new(&venv_path);
+        
+        // Find site-packages directory (logic varies by Python version/OS)
+        // On Linux usually: lib/python3.x/site-packages
+        #[cfg(not(windows))]
+        let lib_dir = p.join("lib");
+        #[cfg(windows)]
+        let lib_dir = p.join("Lib").join("site-packages");
 
-    #[cfg(not(windows))]
-    if let Ok(entries) = fs::read_dir(lib_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && entry.file_name().to_string_lossy().starts_with("python") {
-                let site_pkgs = path.join("site-packages");
-                if site_pkgs.exists() {
-                    if let Ok(pkg_entries) = fs::read_dir(site_pkgs) {
-                        for pkg in pkg_entries.flatten() {
-                            let pkg_path = pkg.path();
-                            let name = pkg.file_name().to_string_lossy().to_string();
-                            if !name.ends_with(".dist-info") && !name.starts_with("__") {
-                                let size = fs_extra::dir::get_size(&pkg_path).unwrap_or(0);
-                                sizes.insert(name, (size as f64) / 1024.0 / 1024.0);
+        #[cfg(not(windows))]
+        if let Ok(entries) = fs::read_dir(lib_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() && entry.file_name().to_string_lossy().starts_with("python") {
+                    let site_pkgs = path.join("site-packages");
+                    if site_pkgs.exists() {
+                        if let Ok(pkg_entries) = fs::read_dir(site_pkgs) {
+                            for pkg in pkg_entries.flatten() {
+                                let pkg_path = pkg.path();
+                                let name = pkg.file_name().to_string_lossy().to_string();
+                                if !name.ends_with(".dist-info") && !name.starts_with("__") {
+                                    sizes.insert(name, safe_dir_size_mb(&pkg_path, 120_000));
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
-    
-    #[cfg(windows)]
-    if lib_dir.exists() {
-        if let Ok(pkg_entries) = fs::read_dir(lib_dir) {
-            for pkg in pkg_entries.flatten() {
-                let pkg_path = pkg.path();
-                let name = pkg.file_name().to_string_lossy().to_string();
-                if !name.ends_with(".dist-info") && !name.starts_with("__") {
-                    let size = fs_extra::dir::get_size(&pkg_path).unwrap_or(0);
-                    sizes.insert(name, (size as f64) / 1024.0 / 1024.0);
+        
+        #[cfg(windows)]
+        if lib_dir.exists() {
+            if let Ok(pkg_entries) = fs::read_dir(lib_dir) {
+                for pkg in pkg_entries.flatten() {
+                    let pkg_path = pkg.path();
+                    let name = pkg.file_name().to_string_lossy().to_string();
+                    if !name.ends_with(".dist-info") && !name.starts_with("__") {
+                        sizes.insert(name, safe_dir_size_mb(&pkg_path, 120_000));
+                    }
                 }
             }
         }
-    }
 
-    Ok(sizes)
+        Ok(sizes)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -215,19 +540,64 @@ services:
 // --- Standard Commands ---
 
 #[tauri::command]
-fn check_venv_health(venv_path: String) -> Result<String, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    let pip = get_pip_path(&venv);
-    let out = Command::new(pip).arg("check").output().map_err(|e| e.to_string())?;
-    if out.status.success() { Ok("No conflicts found.".into()) } else { Ok(String::from_utf8_lossy(&out.stdout).to_string()) }
+async fn check_venv_health(venv_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        let manager = detect_manager_type(&venv);
+        let mut cmd = if manager == "uv" {
+            let uv_path = get_manager_path("uv");
+            let python = get_python_path(&venv);
+            let mut c = Command::new(uv_path);
+            c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+            c.args(["pip", "check", "--python", python.to_str().unwrap()]);
+            c
+        } else {
+            let python = get_python_path(&venv);
+            let mut c = Command::new(python);
+            c.args(["-m", "pip", "check"]);
+            c
+        };
+        let out = run_command_with_timeout(&mut cmd, 90)?;
+        if out.status.success() {
+            Ok("No conflicts found.".into())
+        } else if !out.stdout.is_empty() {
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            Ok(String::from_utf8_lossy(&out.stderr).to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage>, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    let pip = get_pip_path(&venv);
-    let out = Command::new(pip).args(["list", "--outdated", "--format=json"]).output().map_err(|e| e.to_string())?;
-    if out.status.success() { let pkgs: Vec<OutdatedPackage> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?; Ok(pkgs) } else { Ok(Vec::new()) }
+async fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        let manager = detect_manager_type(&venv);
+        let mut cmd = if manager == "uv" {
+            let uv_path = get_manager_path("uv");
+            let python = get_python_path(&venv);
+            let mut c = Command::new(uv_path);
+            c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+            c.args(["pip", "list", "--outdated", "--format", "json", "--python", python.to_str().unwrap()]);
+            c
+        } else {
+            let python = get_python_path(&venv);
+            let mut c = Command::new(python);
+            c.args(["-m", "pip", "list", "--outdated", "--format=json"]);
+            c
+        };
+        let out = run_command_with_timeout(&mut cmd, 120)?;
+        if out.status.success() {
+            let pkgs = parse_outdated_packages_json(&out.stdout)?;
+            Ok(pkgs)
+        } else {
+            Err(format!("Failed to list outdated packages: {}", stdout_or_stderr(&out).trim()))
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -339,6 +709,75 @@ fn open_terminal(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_terminal_with_venv_command(path: String, command: String) -> Result<(), String> {
+    let venv = ensure_venv_dir(&path)?;
+    let safe_path = venv.to_string_lossy().to_string();
+
+    #[cfg(target_os = "linux")]
+    {
+        let activate_cmd = format!("source \"{}/bin/activate\" && {} ; exec bash", safe_path, command);
+        // Try common terminal emulators with command execution support.
+        if Command::new("gnome-terminal")
+            .args(["--working-directory", &safe_path, "--", "bash", "-lc", &activate_cmd])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Command::new("konsole")
+            .args(["--workdir", &safe_path, "-e", "bash", "-lc", &activate_cmd])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Command::new("xfce4-terminal")
+            .args(["--working-directory", &safe_path, "--command", &format!("bash -lc '{}'", activate_cmd.replace('\'', "'\\''"))])
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        if Command::new("xterm")
+            .args(["-e", "bash", "-lc", &activate_cmd])
+            .current_dir(&safe_path)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(());
+        }
+        return Err("No supported terminal emulator found on PATH".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let activate = format!("{}\\Scripts\\activate.bat", safe_path);
+        let cmdline = format!("\"{}\" && {} ", activate, command);
+        Command::new("cmd")
+            .args(["/c", "start", "cmd.exe", "/k", &cmdline])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Terminal\" to do script \"cd '{}' && source '{}/bin/activate' && {}\"",
+            safe_path.replace('\'', "\\'"),
+            safe_path.replace('\'', "\\'"),
+            command.replace('\"', "\\\"")
+        );
+        Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+}
+
+#[tauri::command]
 fn open_in_vscode(path: String) -> Result<(), String> {
     let pb = ensure_venv_dir(&path)?;
     let parent = pb.parent().unwrap_or(&pb).to_string_lossy().to_string();
@@ -357,8 +796,8 @@ fn scan_venv(path: String) -> Result<VenvInfo, String> {
 fn list_venvs(base_path: String) -> Result<Vec<VenvInfo>, String> {
     let mut venvs = Vec::new();
     let root = canonicalize_dir(&base_path)?;
-    // Limit traversal depth to keep scanning responsive on very large monorepos.
-    let walker = WalkDir::new(&root).max_depth(8).into_iter().filter_entry(|e| {
+    // Depth is configurable via PYMANAGER_SCAN_MAX_DEPTH (default: 16).
+    let walker = WalkDir::new(&root).max_depth(scan_max_depth()).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         if name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" { return false; }
         if name.starts_with('.') && name != ".venv" { return false; }
@@ -384,60 +823,284 @@ pub struct ManagerStatus {
 }
 
 #[tauri::command]
-fn audit_security(venv_path: String) -> Result<serde_json::Value, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    let python_path = get_python_path(&venv);
-    
-    // We try to run pip-audit as a module inside the venv for maximum accuracy
-    // Output is requested in JSON format for easy frontend parsing
-    let out = Command::new(python_path)
-        .args(["-m", "pip_audit", "--format", "json"])
-        .output()
-        .map_err(|e| e.to_string())?;
+fn start_diagnostics_job(venv_path: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let (job_id, job) = create_background_job(&state)?;
+    tauri::async_runtime::spawn(async move {
+        let blocking_job = job.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+            let venv = ensure_venv_dir(&venv_path)?;
+            let manager = detect_manager_type(&venv);
+            let python = get_python_path(&venv);
 
-    if out.status.success() {
-        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
-    } else {
-        let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
-        if err_msg.contains("No module named pip_audit") {
-            Err("pip-audit not installed in this environment.".to_string())
-        } else {
-            // pip-audit returns non-zero if vulnerabilities are found, but we still want the JSON from stdout
-            if !out.stdout.is_empty() {
-                return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+            let mut check_cmd = if manager == "uv" {
+                let uv_path = get_manager_path("uv");
+                let mut c = Command::new(uv_path);
+                c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                c.args(["pip", "check", "--python", python.to_str().unwrap()]);
+                c
+            } else {
+                let mut c = Command::new(&python);
+                c.args(["-m", "pip", "check"]);
+                c
+            };
+            let health_out = run_command_with_timeout_and_cancel(&mut check_cmd, 90, blocking_job.cancel.as_ref())?;
+            let health = if health_out.status.success() {
+                "No conflicts found.".to_string()
+            } else {
+                stdout_or_stderr(&health_out)
+            };
+
+            let mut outdated_cmd = if manager == "uv" {
+                let uv_path = get_manager_path("uv");
+                let mut c = Command::new(uv_path);
+                c.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                c.args(["pip", "list", "--outdated", "--format", "json", "--python", python.to_str().unwrap()]);
+                c
+            } else {
+                let mut c = Command::new(&python);
+                c.args(["-m", "pip", "list", "--outdated", "--format=json"]);
+                c
+            };
+            let outdated_out = run_command_with_timeout_and_cancel(&mut outdated_cmd, 120, blocking_job.cancel.as_ref())?;
+            if !outdated_out.status.success() {
+                return Err(format!(
+                    "Failed to list outdated packages: {}",
+                    stdout_or_stderr(&outdated_out).trim()
+                ));
             }
-            Err(err_msg)
+            let outdated = parse_outdated_packages_json(&outdated_out.stdout)?;
+
+            Ok(serde_json::json!({
+                "health": health,
+                "outdated": outdated
+            }))
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|res| res);
+
+        match outcome {
+            Ok(result) => set_job_status(&job, "success", Some(result), None),
+            Err(err) if err == "Cancelled by user" => set_job_status(&job, "cancelled", None, None),
+            Err(err) => set_job_status(&job, "error", None, Some(err)),
         }
-    }
+    });
+    Ok(job_id)
 }
 
 #[tauri::command]
-fn get_dependency_tree(venv_path: String, engine: String) -> Result<serde_json::Value, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    if engine == "uv" {
-        let uv_path = get_manager_path("uv");
-        let python_path = get_python_path(&venv);
-        let out = Command::new(uv_path)
-            .args(["tree", "--format", "json", "--python", python_path.to_str().unwrap()])
-            .output().map_err(|e| e.to_string())?;
-        if out.status.success() {
-            return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
-        } else {
-            return Err(String::from_utf8_lossy(&out.stderr).to_string());
+fn start_security_audit_job(venv_path: String, state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let (job_id, job) = create_background_job(&state)?;
+    tauri::async_runtime::spawn(async move {
+        let blocking_job = job.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
+            let venv = ensure_venv_dir(&venv_path)?;
+            let manager = detect_manager_type(&venv);
+            let python_path = get_python_path(&venv);
+            let python_str = python_path.to_string_lossy().to_string();
+
+            let mut cmd = Command::new(&python_path);
+            cmd.args(["-m", "pip_audit", "--format", "json"]);
+            let out = run_command_with_timeout_and_cancel(&mut cmd, 180, blocking_job.cancel.as_ref())?;
+
+            if out.status.success() {
+                parse_security_audit_json_from_output(&out)
+            } else {
+                let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+                if err_msg.contains("No module named pip_audit") {
+                    if manager == "uv" {
+                        let uv_path = get_manager_path("uv");
+                        let mut uvx = Command::new(uv_path);
+                        uvx.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                        uvx.args(["tool", "run", "--from", "pip-audit", "pip-audit", "--format", "json", "--python", &python_str]);
+                        let uvx_out = run_command_with_timeout_and_cancel(&mut uvx, 240, blocking_job.cancel.as_ref())?;
+                        if uvx_out.status.success() {
+                            parse_security_audit_json_from_output(&uvx_out)
+                        } else if !uvx_out.stdout.is_empty() {
+                            parse_security_audit_json_from_output(&uvx_out)
+                        } else {
+                            Err(format!("pip-audit not installed in this environment. Install with: uv pip install --python \"{}\" pip-audit", python_str))
+                        }
+                    } else {
+                        Err("pip-audit not installed in this environment. Install with: pip install pip-audit".to_string())
+                    }
+                } else if !out.stdout.is_empty() {
+                    parse_security_audit_json_from_output(&out)
+                } else {
+                    Err(err_msg)
+                }
+            }
+        })
+        .await
+        .map_err(|e| e.to_string())
+        .and_then(|res| res);
+
+        match outcome {
+            Ok(result) => set_job_status(&job, "success", Some(result), None),
+            Err(err) if err == "Cancelled by user" => set_job_status(&job, "cancelled", None, None),
+            Err(err) => set_job_status(&job, "error", None, Some(err)),
         }
-    }
+    });
+    Ok(job_id)
+}
 
-    // For PIP, we use pipdeptree. It needs to be installed in the venv.
-    let python_path = get_python_path(&venv);
-    let out = Command::new(python_path)
-        .args(["-m", "pipdeptree", "--json-tree"])
-        .output().map_err(|e| e.to_string())?;
+#[tauri::command]
+fn get_background_job(job_id: String, state: tauri::State<'_, AppState>) -> Result<serde_json::Value, String> {
+    cleanup_finished_jobs(&state, 10 * 60 * 1000)?;
+    let handle = {
+        let jobs = state.jobs.lock().map_err(|_| "Failed to lock job store".to_string())?;
+        jobs.get(&job_id).cloned()
+    };
+    let Some(handle) = handle else {
+        return Err("Job not found".to_string());
+    };
+    let snapshot = handle.snapshot.lock().map_err(|_| "Failed to lock job snapshot".to_string())?;
+    Ok(serde_json::json!({
+        "status": snapshot.status,
+        "result": snapshot.result,
+        "error": snapshot.error,
+    }))
+}
 
-    if out.status.success() {
-        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
-    } else {
-        Err("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string())
-    }
+#[tauri::command]
+fn cancel_background_job(job_id: String, state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    let handle = {
+        let jobs = state.jobs.lock().map_err(|_| "Failed to lock job store".to_string())?;
+        jobs.get(&job_id).cloned()
+    };
+    let Some(handle) = handle else {
+        return Ok(false);
+    };
+    handle.cancel.store(true, Ordering::Relaxed);
+    set_job_status(&handle, "cancelling", None, None);
+    Ok(true)
+}
+
+#[tauri::command]
+async fn audit_security(venv_path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        let manager = detect_manager_type(&venv);
+        let python_path = get_python_path(&venv);
+        let python_str = python_path.to_string_lossy().to_string();
+        
+        // We try to run pip-audit as a module inside the venv for maximum accuracy
+        // Output is requested in JSON format for easy frontend parsing
+        let mut cmd = Command::new(&python_path);
+        cmd.args(["-m", "pip_audit", "--format", "json"]);
+        let out = run_command_with_timeout(&mut cmd, 180)?;
+
+        if out.status.success() {
+            parse_security_audit_json_from_output(&out)
+        } else {
+            let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+            if err_msg.contains("No module named pip_audit") {
+                if manager == "uv" {
+                    let uv_path = get_manager_path("uv");
+                    let mut uvx = Command::new(uv_path);
+                    uvx.env("UV_CACHE_DIR", uv_cache_dir_for(&venv));
+                    uvx.args(["tool", "run", "--from", "pip-audit", "pip-audit", "--format", "json", "--python", &python_str]);
+                    let uvx_out = run_command_with_timeout(&mut uvx, 240)?;
+                    if uvx_out.status.success() {
+                        parse_security_audit_json_from_output(&uvx_out)
+                    } else if !uvx_out.stdout.is_empty() {
+                        parse_security_audit_json_from_output(&uvx_out)
+                    } else {
+                        Err(format!("pip-audit not installed in this environment. Install with: uv pip install --python \"{}\" pip-audit", python_str))
+                    }
+                } else {
+                    Err("pip-audit not installed in this environment. Install with: pip install pip-audit".to_string())
+                }
+            } else {
+                // pip-audit returns non-zero if vulnerabilities are found, but we still want the JSON from stdout
+                if !out.stdout.is_empty() {
+                    return parse_security_audit_json_from_output(&out);
+                }
+                Err(err_msg)
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_dependency_tree(venv_path: String, engine: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        if engine == "uv" {
+            return build_dependency_tree_with_python(&venv);
+        }
+
+        // For PIP, we use pipdeptree. It needs to be installed in the venv.
+        let python_path = get_python_path(&venv);
+        let mut cmd = Command::new(python_path);
+        cmd.args(["-m", "pipdeptree", "--json-tree"]);
+        let out = run_command_with_timeout(&mut cmd, 180)?;
+
+        if out.status.success() {
+            serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+        } else {
+            let raw_err = stdout_or_stderr(&out);
+            let err_lc = raw_err.to_lowercase();
+            if err_lc.contains("no module named pipdeptree")
+                || (err_lc.contains("modulenotfounderror") && err_lc.contains("pipdeptree"))
+            {
+                Err("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string())
+            } else if raw_err.trim().is_empty() {
+                Err("Failed to build dependency tree for this environment.".to_string())
+            } else {
+                Err(raw_err)
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn check_dependency_tree_prereq(venv_path: String, engine: String) -> Result<DependencyTreePrereq, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+
+        if engine == "uv" {
+            return Ok(DependencyTreePrereq { ok: true, message: None });
+        }
+
+        let python_path = get_python_path(&venv);
+        let mut cmd = Command::new(python_path);
+        cmd.args([
+            "-c",
+            "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('pipdeptree') else 1)",
+        ]);
+
+        match run_command_with_timeout(&mut cmd, 4) {
+            Ok(out) if out.status.success() => Ok(DependencyTreePrereq { ok: true, message: None }),
+            Ok(out) => {
+                let raw_err = stdout_or_stderr(&out);
+                let err_lc = raw_err.to_lowercase();
+                if err_lc.contains("no module named pipdeptree")
+                    || (err_lc.contains("modulenotfounderror") && err_lc.contains("pipdeptree"))
+                {
+                    Ok(DependencyTreePrereq {
+                        ok: false,
+                        message: Some("pipdeptree not found. Please install it in the environment to see the dependency tree.".to_string()),
+                    })
+                } else {
+                    // Non-zero for other reasons: don't block tree loading with a false missing-tool error.
+                    Ok(DependencyTreePrereq { ok: true, message: None })
+                }
+            }
+            Err(err) => {
+                // Avoid false negatives in prereq check. If check fails unexpectedly, allow tree command
+                // to run and report the real error instead of claiming missing dependency.
+                let _ = err;
+                Ok(DependencyTreePrereq { ok: true, message: None })
+            }
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -457,7 +1120,7 @@ fn audit_environments(workspace_paths: Vec<String>, registered_paths: Vec<String
     for ws in workspace_paths {
         let Ok(root) = canonicalize_dir(&ws) else { continue };
         
-        let walker = WalkDir::new(&root).max_depth(3).into_iter().filter_entry(|e| {
+        let walker = WalkDir::new(&root).max_depth(scan_max_depth()).into_iter().filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             !["node_modules", "target", "__pycache__", ".git"].contains(&name.as_ref())
         });
@@ -541,10 +1204,9 @@ fn get_manager_path(cmd: &str) -> String {
     cmd.to_string()
 }
 
-#[tauri::command]
-fn create_venv(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
+fn create_venv_internal(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
     let root = canonicalize_dir(&path)?;
-    let mut full_path = root;
+    let mut full_path = root.clone();
     full_path.push(&name);
     let target_path = full_path.to_str().unwrap();
 
@@ -552,17 +1214,90 @@ fn create_venv(path: String, name: String, python_bin: String, engine: String) -
         let uv_path = get_manager_path("uv");
         let mut cmd = Command::new(uv_path);
         cmd.args(["venv", target_path]);
-        if !python_bin.is_empty() { cmd.arg("--python").arg(&python_bin); }
+        cmd.env("UV_CACHE_DIR", uv_cache_dir_for(&root));
+        if !python_bin.is_empty() {
+            cmd.arg("--python").arg(&python_bin);
+        }
         let output = cmd.output().map_err(|e| e.to_string())?;
-        if output.status.success() { return Ok(format!("Created with uv: {}", name)); }
-        else { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
+        if output.status.success() {
+            persist_engine_marker(Path::new(target_path), "uv");
+            return Ok(target_path.to_string());
+        } else {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
     }
-    // ...
 
-    let bin = if python_bin.is_empty() { "python3".to_string() } else { python_bin };
-    let output = Command::new(bin).args(["-m", "venv", target_path]).output().map_err(|e| e.to_string())?;
-    if output.status.success() { Ok(format!("Created with venv: {}", name)) } 
-    else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+    let bin = if python_bin.is_empty() {
+        "python3".to_string()
+    } else {
+        python_bin
+    };
+    let output = Command::new(bin)
+        .args(["-m", "venv", target_path])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        persist_engine_marker(Path::new(target_path), "pip");
+        Ok(target_path.to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+fn install_dependency_internal(venv_path: String, package: String, engine: String) -> Result<String, String> {
+    let venv = ensure_venv_dir(&venv_path)?;
+    if engine == "uv" {
+        let uv_path = get_manager_path("uv");
+        let python_path = get_python_path(&venv);
+        let output = Command::new(uv_path)
+            .env("UV_CACHE_DIR", uv_cache_dir_for(&venv))
+            .args(["pip", "install", "--python", python_path.to_str().unwrap(), &package])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            return Ok(format!("uv installed {}", package));
+        } else {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+    }
+
+    let p = get_pip_path(&venv);
+    let output = Command::new(p)
+        .args(["install", &package])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(format!("Installed {}", package))
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[tauri::command]
+fn create_venv(path: String, name: String, python_bin: String, engine: String) -> Result<String, String> {
+    create_venv_internal(path, name.clone(), python_bin, engine)?;
+    Ok(format!("Created {}", name))
+}
+
+#[tauri::command]
+async fn create_venv_with_template(
+    path: String,
+    name: String,
+    python_bin: String,
+    engine: String,
+    packages: Vec<String>,
+) -> Result<VenvSetupResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv_path = create_venv_internal(path, name, python_bin, engine.clone())?;
+        let mut installed = Vec::new();
+        for pkg in packages {
+            install_dependency_internal(venv_path.clone(), pkg.clone(), engine.clone())?;
+            installed.push(pkg);
+        }
+        Ok(VenvSetupResult { venv_path, installed })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -578,20 +1313,7 @@ fn delete_venv(path: String) -> Result<String, String> {
 
 #[tauri::command]
 fn install_dependency(venv_path: String, package: String, engine: String) -> Result<String, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    if engine == "uv" {
-        let uv_path = get_manager_path("uv");
-        let python_path = get_python_path(&venv);
-        let output = Command::new(uv_path)
-            .args(["pip", "install", "--python", python_path.to_str().unwrap(), &package])
-            .output().map_err(|e| e.to_string())?;
-        if output.status.success() { return Ok(format!("uv installed {}", package)); }
-        else { return Err(String::from_utf8_lossy(&output.stderr).to_string()); }
-    }
-
-    let p = get_pip_path(&venv);
-    let output = Command::new(p).args(["install", &package]).output().map_err(|e| e.to_string())?;
-    if output.status.success() { Ok(format!("Installed {}", package)) } else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+    install_dependency_internal(venv_path, package, engine)
 }
 
 #[tauri::command]
@@ -601,6 +1323,7 @@ fn uninstall_package(venv_path: String, package: String, engine: String) -> Resu
         let uv_path = get_manager_path("uv");
         let python_path = get_python_path(&venv);
         let out = Command::new(uv_path)
+            .env("UV_CACHE_DIR", uv_cache_dir_for(&venv))
             .args(["pip", "uninstall", "--python", python_path.to_str().unwrap(), "-y", &package])
             .output().map_err(|e| e.to_string())?;
         if out.status.success() { return Ok(format!("uv uninstalled {}", package)); }
@@ -619,6 +1342,7 @@ fn update_package(venv_path: String, package: String, engine: String) -> Result<
         let uv_path = get_manager_path("uv");
         let python_path = get_python_path(&venv);
         let out = Command::new(uv_path)
+            .env("UV_CACHE_DIR", uv_cache_dir_for(&venv))
             .args(["pip", "install", "--upgrade", "--python", python_path.to_str().unwrap(), &package])
             .output().map_err(|e| e.to_string())?;
         if out.status.success() { return Ok(format!("uv updated {}", package)); }
@@ -631,16 +1355,15 @@ fn update_package(venv_path: String, package: String, engine: String) -> Result<
 }
 
 #[tauri::command]
-fn get_venv_details(path: String) -> Result<VenvDetails, String> {
-    let p = ensure_venv_dir(&path)?;
-    let size_bytes = fs_extra::dir::get_size(&p).unwrap_or(0);
-    let size_mb = (size_bytes as f64) / 1024.0 / 1024.0;
-    let pip = get_pip_path(&p);
-    let mut packages = Vec::new();
-    if let Ok(output) = Command::new(pip).args(["list", "--format=freeze"]).output() {
-        packages = String::from_utf8_lossy(&output.stdout).lines().map(|s| s.to_string()).collect();
-    }
-    Ok(VenvDetails { packages, size_mb })
+async fn get_venv_details(path: String) -> Result<VenvDetails, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = ensure_venv_dir(&path)?;
+        let size_mb = safe_dir_size_mb(&p, 300_000);
+        let packages = list_installed_packages(&p)?;
+        Ok(VenvDetails { packages, size_mb })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -680,14 +1403,17 @@ pub fn run() {
         Migration { version: 6, description: "default_workspace", sql: "ALTER TABLE workspaces ADD COLUMN is_default INTEGER DEFAULT 0;", kind: MigrationKind::Up }
     ];
     tauri::Builder::default()
+        .manage(AppState::default())
         .plugin(tauri_plugin_sql::Builder::default().add_migrations("sqlite:py-manager.db", migrations).build())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            start_diagnostics_job, start_security_audit_job, get_background_job, cancel_background_job,
+            check_dependency_tree_prereq,
             get_package_sizes, generate_docker_files, check_managers, audit_environments, get_dependency_tree, audit_security,
             check_venv_health, list_outdated_packages, scan_venv, run_venv_script, read_env_file, save_env_file, 
-            open_terminal, open_in_vscode, create_venv, list_venvs, delete_venv, 
+            open_terminal, open_terminal_with_venv_command, open_in_vscode, create_venv, create_venv_with_template, list_venvs, delete_venv, 
             install_dependency, get_venv_details, list_system_pythons, uninstall_package, update_package, purge_pip_cache,
             export_requirements, get_pyvenv_cfg, search_pypi
         ])

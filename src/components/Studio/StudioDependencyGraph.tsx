@@ -12,7 +12,7 @@ import ReactFlow, {
 import 'reactflow/dist/style.css';
 import { VenvInfo } from '../../types';
 import { packageService } from '../../services/packageManager';
-import { Loader2, Layers } from 'lucide-react';
+import { Loader2, Layers, RefreshCcw } from 'lucide-react';
 
 interface StudioDependencyGraphProps {
   venv: VenvInfo;
@@ -28,37 +28,33 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
   const buildGraph = (data: any[], depth: number) => {
     const newNodes: Node[] = [];
     const newEdges: Edge[] = [];
-    const processed = new Set();
 
-    const traverse = (item: any, parentId: string | null = null, level = 0, xOffset = 0) => {
+    const traverse = (item: any, parentId: string | null = null, level = 0, xOffset = 0, path = "root") => {
       if (level > depth) return; // KILL SWITCH for performance
 
       const name = item.package_name || item.name;
       const version = item.installed_version || item.version;
-      const id = name.toLowerCase();
+      const id = `${path}/${name.toLowerCase()}@${String(version || "unknown").toLowerCase()}`;
 
-      if (!processed.has(id)) {
-        newNodes.push({
-          id,
-          data: { label: (
-            <div className="flex flex-col items-center">
-              <span className="font-black text-[9px] uppercase truncate w-full text-center">{name}</span>
-              <span className="text-[7px] font-mono opacity-60">{version}</span>
-            </div>
-          )},
-          position: { x: xOffset, y: level * 120 },
-          style: {
-            background: level === 0 ? '#2563eb' : (level === 1 ? '#3b82f6' : '#fff'),
-            color: level === 0 || level === 1 ? '#fff' : '#1e293b',
-            border: '1.5px solid #2563eb',
-            borderRadius: '10px',
-            padding: '6px',
-            width: 110,
-            boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
-          },
-        });
-        processed.add(id);
-      }
+      newNodes.push({
+        id,
+        data: { label: (
+          <div className="flex flex-col items-center">
+            <span className="font-black text-[9px] uppercase truncate w-full text-center">{name}</span>
+            <span className="text-[7px] font-mono opacity-60">{version}</span>
+          </div>
+        )},
+        position: { x: xOffset, y: level * 120 },
+        style: {
+          background: level === 0 ? '#2563eb' : (level === 1 ? '#3b82f6' : '#fff'),
+          color: level === 0 || level === 1 ? '#fff' : '#1e293b',
+          border: '1.5px solid #2563eb',
+          borderRadius: '10px',
+          padding: '6px',
+          width: 110,
+          boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)',
+        },
+      });
 
       if (parentId) {
         newEdges.push({
@@ -74,7 +70,7 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
 
       if (item.dependencies && level < depth) {
         item.dependencies.forEach((dep: any, index: number) => {
-          traverse(dep, id, level + 1, xOffset + (index - item.dependencies.length/2) * 130);
+          traverse(dep, id, level + 1, xOffset + (index - item.dependencies.length/2) * 130, `${id}#${index}`);
         });
       }
     };
@@ -86,22 +82,23 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
     setEdges(newEdges);
   };
 
+  const fetchData = async (force = false) => {
+    setLoading(true);
+    try {
+      const tree = await packageService.getDependencyTree(venv, { force });
+      const data = Array.isArray(tree) ? tree : [tree];
+      setFullData(data);
+      buildGraph(data, maxDepth);
+    } catch (err) {
+      console.error("Graph Error:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      try {
-        const tree = await packageService.getDependencyTree(venv);
-        const data = Array.isArray(tree) ? tree : [tree];
-        setFullData(data);
-        buildGraph(data, maxDepth);
-      } catch (err) {
-        console.error("Graph Error:", err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchData();
-  }, [venv]);
+    fetchData(false);
+  }, [venv.path, venv.manager_type]);
 
   useEffect(() => {
     if (fullData.length > 0) {
@@ -124,6 +121,13 @@ export const StudioDependencyGraph: React.FC<StudioDependencyGraphProps> = ({ ve
         <div className="flex items-center gap-3">
             <div className="p-2 bg-blue-600 text-white rounded-lg"><Layers size={14}/></div>
             <p className="text-[10px] font-black uppercase tracking-widest">Scan Depth Control</p>
+            <button
+              onClick={() => fetchData(true)}
+              className="flex items-center gap-1 text-[9px] font-black uppercase tracking-wide text-blue-600 hover:underline"
+            >
+              <RefreshCcw size={12} />
+              Refresh
+            </button>
         </div>
         <div className="flex bg-slate-100 dark:bg-slate-800 p-0.5 rounded-lg border border-slate-200 dark:border-slate-700">
             {[1, 2, 3].map(d => (
