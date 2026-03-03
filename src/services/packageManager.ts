@@ -7,7 +7,7 @@ class PackageManagerService {
   private static readonly TREE_CACHE_TTL_MS = 60_000;
 
   private treeCacheKey(venv: VenvInfo): string {
-    return `${venv.path}::${venv.manager_type}`;
+    return `${venv.path}::${venv.manager_type}::${venv.last_modified}`;
   }
 
   private invalidateDependencyTreeCacheByPath(venvPath: string) {

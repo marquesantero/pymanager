@@ -142,6 +142,14 @@ fn safe_dir_size_mb(root: &Path, max_entries: usize) -> f64 {
     (total_bytes as f64) / 1024.0 / 1024.0
 }
 
+fn scan_max_depth() -> usize {
+    std::env::var("PYMANAGER_SCAN_MAX_DEPTH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(3, 64))
+        .unwrap_or(16)
+}
+
 fn run_command_with_timeout(command: &mut Command, timeout_secs: u64) -> Result<Output, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|e| e.to_string())?;
@@ -540,8 +548,8 @@ fn scan_venv(path: String) -> Result<VenvInfo, String> {
 fn list_venvs(base_path: String) -> Result<Vec<VenvInfo>, String> {
     let mut venvs = Vec::new();
     let root = canonicalize_dir(&base_path)?;
-    // Limit traversal depth to keep scanning responsive on very large monorepos.
-    let walker = WalkDir::new(&root).max_depth(8).into_iter().filter_entry(|e| {
+    // Depth is configurable via PYMANAGER_SCAN_MAX_DEPTH (default: 16).
+    let walker = WalkDir::new(&root).max_depth(scan_max_depth()).into_iter().filter_entry(|e| {
         let name = e.file_name().to_string_lossy();
         if name == "node_modules" || name == "target" || name == "__pycache__" || name == ".git" { return false; }
         if name.starts_with('.') && name != ".venv" { return false; }
@@ -762,7 +770,7 @@ fn audit_environments(workspace_paths: Vec<String>, registered_paths: Vec<String
     for ws in workspace_paths {
         let Ok(root) = canonicalize_dir(&ws) else { continue };
         
-        let walker = WalkDir::new(&root).max_depth(3).into_iter().filter_entry(|e| {
+        let walker = WalkDir::new(&root).max_depth(scan_max_depth()).into_iter().filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             !["node_modules", "target", "__pycache__", ".git"].contains(&name.as_ref())
         });

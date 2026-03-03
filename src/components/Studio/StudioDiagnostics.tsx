@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ShieldAlert, AlertCircle, CheckCircle2, Loader2, RefreshCcw, ExternalLink, ShieldCheck } from "lucide-react";
 import { VenvInfo, OutdatedPackage } from "../../types";
@@ -17,6 +17,8 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
   const [hasRunDiagnostics, setHasRunDiagnostics] = useState(false);
   const [diagnosticsJobId, setDiagnosticsJobId] = useState<string | null>(null);
   const [securityJobId, setSecurityJobId] = useState<string | null>(null);
+  const diagnosticsJobIdRef = useRef<string | null>(null);
+  const securityJobIdRef = useRef<string | null>(null);
 
   const runFullDiagnostics = async () => {
     try {
@@ -50,6 +52,14 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
       console.error("Cancel failed:", err);
     }
   };
+
+  useEffect(() => {
+    diagnosticsJobIdRef.current = diagnosticsJobId;
+  }, [diagnosticsJobId]);
+
+  useEffect(() => {
+    securityJobIdRef.current = securityJobId;
+  }, [securityJobId]);
 
   useEffect(() => {
     if (!diagnosticsJobId) return;
@@ -129,6 +139,10 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
   }, [securityJobId]);
 
   useEffect(() => {
+    // Ensure we do not leave heavy jobs running after switching environments.
+    void cancelJob(diagnosticsJobIdRef.current);
+    void cancelJob(securityJobIdRef.current);
+
     setHealth("");
     setOutdatedPkgs([]);
     setSecurityReport(null);
@@ -139,6 +153,13 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
     setDiagnosticsJobId(null);
     setSecurityJobId(null);
   }, [venv.path]);
+
+  useEffect(() => {
+    return () => {
+      void cancelJob(diagnosticsJobIdRef.current);
+      void cancelJob(securityJobIdRef.current);
+    };
+  }, []);
 
   return (
     <div className="space-y-10 animate-in fade-in duration-500 text-slate-900 dark:text-slate-100">
