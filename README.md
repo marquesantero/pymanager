@@ -1,75 +1,81 @@
-# PyManager Orchestrator 🐍
+# PyManager Orchestrator
 
-A professional, high-level Python Virtual Environment Orchestrator built with **Tauri v2**, **Rust**, **React 19**, and **Tailwind CSS v4**.
+Aplicacao desktop para gerenciar ambientes virtuais Python com foco em produtividade: descoberta de venvs, manutencao de pacotes, diagnostico, automacao e higiene global de workspaces.
 
-PyManager has evolved from a simple manager into a complete development lifecycle orchestrator, solving the "venv hell" with visual intelligence and automated hygiene.
+Stack principal:
+- Tauri v2 (Rust)
+- React 19 + TypeScript
+- Tailwind CSS v4
+- SQLite (`tauri-plugin-sql`)
 
----
+## O que o app faz
+- Descobre venvs em workspaces com cache local no SQLite.
+- Cria ambientes usando `pip` ou `uv`.
+- Instala templates de pacotes na criacao do ambiente.
+- Abre terminal e VS Code diretamente no contexto do ambiente.
+- Oferece um Studio por venv com:
+  - gestao de pacotes (upgrade/uninstall/export)
+  - arvore e grafo de dependencias
+  - scripts de automacao
+  - edicao de `.env` e leitura de `pyvenv.cfg`
+  - diagnostico de saude e seguranca (`pip-audit`)
+  - geracao de Dockerfile e `docker-compose.yml` (preview/copia)
+- Executa higiene global (prune/adopt) para sincronizar DB e disco.
 
-## ✨ New & Advanced Features
+## Requisitos
+- Node.js 20+
+- Rust 1.85+
+- Python 3.x
 
-### 🚀 Hybrid Management Engine
-- **pip + uv Dual-Core:** Native support for the [uv](https://github.com/astral-sh/uv) manager. Create environments and install templates up to **100x faster**.
-- **Auto-Discovery:** Automatically detects if an environment uses `pip` or `uv` and uses the correct motor for all operations.
+Opcional (recomendado):
+- `uv`
+- `pipdeptree` (para arvore em venv pip)
+- `pip-audit` (para security audit)
+- CLI `code` do VS Code
 
-### 🔍 Global Intelligence & Discovery
-- **Command Palette (Ctrl+K):** Instant navigation. Search for environments or paths across all your workspaces from anywhere in the app.
-- **Global Hygiene:** A specialized auditor that syncs your database with the physical disk, allowing you to **Prune** dead links and **Adopt** orphan environments.
+## Como rodar localmente
+```bash
+npm install
+npm run tauri dev
+```
 
-### 🌳 Dependency Visualizer
-- **Interactive Graph:** Visualize your libraries as a visual map using **React Flow**. Understand complex relationships with zoom and pan controls.
-- **Lazy-Loaded Tree View:** Explore hierarchical dependencies without performance lag, even in massive environments like Anaconda.
-
-### 🛡️ Security & Health
-- **Security Audit:** Integrated scan for known vulnerabilities (CVEs) using the PyPA Advisory Database.
-- **Health Diagnostics:** One-click consistency checks (`pip check`) and outdated package detection.
-
-### 🐳 Deployment & Automation
-- **Docker Generator:** Optimized `Dockerfile` and `docker-compose.yml` generation based on your environment's Python version and packages.
-- **Script Runner:** Save and execute automation snippets directly within the virtual environment context.
-
----
-
-## 🛠️ Tech Stack
-
-- **Framework:** [Tauri v2](https://tauri.app/)
-- **Backend:** [Rust](https://www.rust-lang.org/) (Performance & OS Bridge)
-- **Frontend:** [React 19](https://react.dev/), [TypeScript](https://www.typescriptlang.org/)
-- **Graph Engine:** [React Flow](https://reactflow.dev/)
-- **Database:** [SQLite](https://www.sqlite.org/) via `tauri-plugin-sql`
-- **Styling:** [Tailwind CSS v4](https://tailwindcss.com/)
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-- [Rust](https://rustup.rs/) (1.85.1+)
-- [Node.js](https://nodejs.org/) (v20+)
-- [uv](https://github.com/astral-sh/uv) (Optional but highly recommended for speed)
-
-### Installation
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/marquesantero/pymanager.git
-   cd pymanager
-   ```
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-3. Run in development mode:
-   ```bash
-   npm run tauri dev
-   ```
-
----
-
-## 🏗️ Build
-To build the production-ready application for your OS:
+Build de producao:
 ```bash
 npm run tauri build
 ```
 
----
-*Created by [Marques Antero](https://github.com/marquesantero). Python development, orchestrated.*
+## Scripts disponiveis
+- `npm run dev`: frontend Vite
+- `npm run build`: build frontend (TypeScript + Vite)
+- `npm run tauri dev`: app desktop em desenvolvimento
+- `npm run tauri build`: bundle desktop
+
+## Estrutura do projeto
+```text
+src/
+  App.tsx
+  components/
+  services/
+src-tauri/
+  src/lib.rs
+  Cargo.toml
+DOCUMENTATION.md
+```
+
+## Banco local (SQLite)
+Arquivo: `py-manager.db`
+
+Tabelas principais:
+- `workspaces`
+- `venvs`
+- `scripts`
+- `custom_templates`
+
+## Observacoes tecnicas
+- A engine (`pip`/`uv`) e detectada por ambiente e respeitada nas operacoes de pacote.
+- `search_pypi` ja existe no backend, mas nao esta conectado na UI atual.
+- O modulo de deploy gera manifests em memoria para copia; nao persiste arquivos automaticamente.
+
+## Documentacao detalhada
+A analise tecnica completa da aplicacao esta em:
+- [DOCUMENTATION.md](./DOCUMENTATION.md)
