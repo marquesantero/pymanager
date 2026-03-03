@@ -414,7 +414,7 @@ async fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage
             let pkgs: Vec<OutdatedPackage> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
             Ok(pkgs)
         } else {
-            Ok(Vec::new())
+            Err(format!("Failed to list outdated packages: {}", stdout_or_stderr(&out).trim()))
         }
     })
     .await
@@ -595,11 +595,13 @@ fn start_diagnostics_job(venv_path: String, state: tauri::State<'_, AppState>) -
             let mut outdated_cmd = Command::new(&pip);
             outdated_cmd.args(["list", "--outdated", "--format=json"]);
             let outdated_out = run_command_with_timeout_and_cancel(&mut outdated_cmd, 120, blocking_job.cancel.as_ref())?;
-            let outdated: Vec<OutdatedPackage> = if outdated_out.status.success() {
-                serde_json::from_slice(&outdated_out.stdout).map_err(|e| e.to_string())?
-            } else {
-                Vec::new()
-            };
+            if !outdated_out.status.success() {
+                return Err(format!(
+                    "Failed to list outdated packages: {}",
+                    stdout_or_stderr(&outdated_out).trim()
+                ));
+            }
+            let outdated: Vec<OutdatedPackage> = serde_json::from_slice(&outdated_out.stdout).map_err(|e| e.to_string())?;
 
             Ok(serde_json::json!({
                 "health": health,
