@@ -2,7 +2,6 @@ import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ShieldAlert, AlertCircle, CheckCircle2, Loader2, RefreshCcw, ExternalLink, ShieldCheck } from "lucide-react";
 import { VenvInfo, OutdatedPackage } from "../../types";
-import { packageService } from "../../services/packageManager";
 
 interface StudioDiagnosticsProps {
   venv: VenvInfo;
@@ -16,36 +15,118 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
   const [loadingSecurity, setLoadingSecurity] = useState(false);
   const [securityError, setSecurityError] = useState<string | null>(null);
   const [hasRunDiagnostics, setHasRunDiagnostics] = useState(false);
+  const [diagnosticsJobId, setDiagnosticsJobId] = useState<string | null>(null);
+  const [securityJobId, setSecurityJobId] = useState<string | null>(null);
 
   const runFullDiagnostics = async () => {
-    setLoadingHealth(true);
-    setHasRunDiagnostics(true);
     try {
-      const [healthText, outdated] = await Promise.all([
-        invoke<string>("check_venv_health", { venvPath: venv.path }),
-        invoke<OutdatedPackage[]>("list_outdated_packages", { venvPath: venv.path })
-      ]);
-      setHealth(healthText);
-      setOutdatedPkgs(outdated);
+      setLoadingHealth(true);
+      setHasRunDiagnostics(true);
+      const jobId = await invoke<string>("start_diagnostics_job", { venvPath: venv.path });
+      setDiagnosticsJobId(jobId);
     } catch (err) {
       console.error(err);
-    } finally {
       setLoadingHealth(false);
     }
   };
 
   const runSecurityAudit = async () => {
-    setLoadingSecurity(true);
-    setSecurityError(null);
     try {
-      const report = await packageService.auditSecurity(venv.path);
-      setSecurityReport(report);
+      setLoadingSecurity(true);
+      setSecurityError(null);
+      const jobId = await invoke<string>("start_security_audit_job", { venvPath: venv.path });
+      setSecurityJobId(jobId);
     } catch (err: any) {
       setSecurityError(err.toString());
-    } finally {
       setLoadingSecurity(false);
     }
   };
+
+  const cancelJob = async (jobId: string | null) => {
+    if (!jobId) return;
+    try {
+      await invoke<boolean>("cancel_background_job", { jobId });
+    } catch (err) {
+      console.error("Cancel failed:", err);
+    }
+  };
+
+  useEffect(() => {
+    if (!diagnosticsJobId) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const snapshot = await invoke<any>("get_background_job", { jobId: diagnosticsJobId });
+        if (stopped) return;
+        const status = snapshot?.status;
+        if (status === "success") {
+          setHealth(snapshot?.result?.health || "");
+          setOutdatedPkgs(snapshot?.result?.outdated || []);
+          setLoadingHealth(false);
+          setDiagnosticsJobId(null);
+        } else if (status === "error") {
+          setHealth(snapshot?.error || "Diagnostics failed.");
+          setOutdatedPkgs([]);
+          setLoadingHealth(false);
+          setDiagnosticsJobId(null);
+        } else if (status === "cancelled") {
+          setHealth("Diagnostics cancelled.");
+          setOutdatedPkgs([]);
+          setLoadingHealth(false);
+          setDiagnosticsJobId(null);
+        }
+      } catch (err) {
+        if (!stopped) {
+          setHealth(`Diagnostics polling failed: ${err}`);
+          setLoadingHealth(false);
+          setDiagnosticsJobId(null);
+        }
+      }
+    };
+    const timer = window.setInterval(poll, 500);
+    poll();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [diagnosticsJobId]);
+
+  useEffect(() => {
+    if (!securityJobId) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const snapshot = await invoke<any>("get_background_job", { jobId: securityJobId });
+        if (stopped) return;
+        const status = snapshot?.status;
+        if (status === "success") {
+          setSecurityReport(snapshot?.result || null);
+          setLoadingSecurity(false);
+          setSecurityJobId(null);
+        } else if (status === "error") {
+          setSecurityError(snapshot?.error || "Security audit failed.");
+          setLoadingSecurity(false);
+          setSecurityJobId(null);
+        } else if (status === "cancelled") {
+          setSecurityError("Security audit cancelled.");
+          setLoadingSecurity(false);
+          setSecurityJobId(null);
+        }
+      } catch (err: any) {
+        if (!stopped) {
+          setSecurityError(`Security polling failed: ${err?.toString?.() || err}`);
+          setLoadingSecurity(false);
+          setSecurityJobId(null);
+        }
+      }
+    };
+    const timer = window.setInterval(poll, 500);
+    poll();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [securityJobId]);
 
   useEffect(() => {
     setHealth("");
@@ -53,6 +134,10 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
     setSecurityReport(null);
     setSecurityError(null);
     setHasRunDiagnostics(false);
+    setLoadingHealth(false);
+    setLoadingSecurity(false);
+    setDiagnosticsJobId(null);
+    setSecurityJobId(null);
   }, [venv.path]);
 
   return (
@@ -64,10 +149,20 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
             <h3 className="font-black text-xs uppercase tracking-widest flex items-center gap-2">
               <CheckCircle2 size={16} className="text-green-500"/> Consistency Check
             </h3>
-            <button onClick={runFullDiagnostics} className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-blue-700 transition-all">
-              <RefreshCcw size={12} className={loadingHealth ? "animate-spin" : ""}/>
-              {loadingHealth ? "Running..." : "Run Diagnostics"}
-            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={runFullDiagnostics} disabled={loadingHealth} className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-blue-700 transition-all disabled:opacity-50">
+                <RefreshCcw size={12} className={loadingHealth ? "animate-spin" : ""}/>
+                {loadingHealth ? "Running..." : "Run Diagnostics"}
+              </button>
+              {loadingHealth && (
+                <button
+                  onClick={() => cancelJob(diagnosticsJobId)}
+                  className="px-3 py-1.5 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-slate-300 dark:hover:bg-slate-700 transition-all"
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
           </div>
           <pre className="text-[10px] font-mono p-4 bg-slate-50 dark:bg-slate-950 rounded-2xl border border-slate-100 dark:border-slate-800 overflow-auto max-h-32">
             {loadingHealth ? "Running check..." : hasRunDiagnostics ? (health || "No output") : "Click 'Run Diagnostics' to start."}
@@ -108,6 +203,14 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
             {loadingSecurity ? <Loader2 size={14} className="animate-spin"/> : <ShieldAlert size={14}/>}
             {loadingSecurity ? "Auditing..." : "Run Security Scan"}
           </button>
+          {loadingSecurity && (
+            <button
+              onClick={() => cancelJob(securityJobId)}
+              className="px-6 py-2.5 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-200 rounded-2xl text-[10px] font-black uppercase hover:bg-slate-300 dark:hover:bg-slate-700 transition-all"
+            >
+              Cancel
+            </button>
+          )}
         </div>
 
         {securityError ? (
