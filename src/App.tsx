@@ -12,6 +12,7 @@ import { dbService } from "./services/db";
 
 import { Sidebar } from "./components/Sidebar";
 import { HygieneOverlay } from "./components/HygieneOverlay";
+import { CommandPalette } from "./components/CommandPalette";
 import { StudioPackages } from "./components/Studio/StudioPackages";
 import { StudioAutomation } from "./components/Studio/StudioAutomation";
 import { StudioConfig } from "./components/Studio/StudioConfig";
@@ -47,6 +48,18 @@ export default function App() {
   const [availableManagers, setAvailableManagers] = useState({ uv: false, poetry: false, pdm: false });
   const [selectedEngine, setSelectedEngine] = useState<"pip" | "uv">("pip");
   const [isHygieneOpen, setIsHygieneOpen] = useState(false);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+
+  useEffect(() => {
+    const handleGlobalKeys = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === "k") {
+        e.preventDefault();
+        setIsSearchOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handleGlobalKeys);
+    return () => window.removeEventListener("keydown", handleGlobalKeys);
+  }, []);
 
   useEffect(() => {
     const load = async () => {
@@ -293,7 +306,7 @@ export default function App() {
 
       {isHygieneOpen && (
         <HygieneOverlay 
-          workspaces={workspaces}
+          workspaces={workspaces.map(w => w.path)}
           onClose={() => setIsHygieneOpen(false)}
           onRefresh={async () => {
             setVenvCache(await dbService.getCachedVenvs());
@@ -301,6 +314,14 @@ export default function App() {
           setMessage={setMessage}
         />
       )}
-    </div>
-  );
-}
+
+      <CommandPalette 
+        isOpen={isSearchOpen}
+        onClose={() => setIsSearchOpen(false)}
+        venvCache={venvCache}
+        onSelectVenv={openStudio}
+      />
+      </div>
+      );
+      }
+
