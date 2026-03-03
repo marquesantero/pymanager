@@ -26,6 +26,7 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
   const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
@@ -34,7 +35,9 @@ export const StudioPackages: React.FC<StudioPackagesProps> = ({ venv, details: i
       setLoading(true);
       try {
         const d: VenvDetails = await invoke("get_venv_details", { path: venv.path });
-        if (mountedRef.current) setLocalDetails(d);
+        if (mountedRef.current) {
+          setLocalDetails(d);
+        }
       } catch (err) {
         console.error("Error fetching venv details:", err);
       } finally {

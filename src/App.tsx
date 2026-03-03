@@ -182,13 +182,6 @@ export default function App() {
           setPyvenvCfg(cfg);
         })
         .catch((e) => console.error("pyvenv.cfg load error:", e));
-
-      invoke<VenvDetails>("get_venv_details", { path: v.path })
-        .then((details) => {
-          if (!mountedRef.current || studioLoadIdRef.current !== loadId) return;
-          setVenvDetails(details);
-        })
-        .catch((e) => console.error("Venv details load error:", e));
     } catch (e) {
       console.error("BG Load Error:", e);
     }

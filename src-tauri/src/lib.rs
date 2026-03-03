@@ -117,6 +117,26 @@ fn get_venv_info(p: &Path) -> Option<VenvInfo> {
     None
 }
 
+fn safe_dir_size_mb(root: &Path, max_entries: usize) -> f64 {
+    let mut total_bytes: u64 = 0;
+    let mut seen: usize = 0;
+
+    for entry in WalkDir::new(root).follow_links(false).into_iter().filter_map(|e| e.ok()) {
+        if seen >= max_entries {
+            break;
+        }
+        seen += 1;
+        let p = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(p) {
+            if meta.file_type().is_file() {
+                total_bytes = total_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+
+    (total_bytes as f64) / 1024.0 / 1024.0
+}
+
 // --- New Commands for Analysis ---
 
 #[tauri::command]
@@ -143,8 +163,7 @@ fn get_package_sizes(venv_path: String) -> Result<HashMap<String, f64>, String> 
                             let pkg_path = pkg.path();
                             let name = pkg.file_name().to_string_lossy().to_string();
                             if !name.ends_with(".dist-info") && !name.starts_with("__") {
-                                let size = fs_extra::dir::get_size(&pkg_path).unwrap_or(0);
-                                sizes.insert(name, (size as f64) / 1024.0 / 1024.0);
+                                sizes.insert(name, safe_dir_size_mb(&pkg_path, 120_000));
                             }
                         }
                     }
@@ -160,8 +179,7 @@ fn get_package_sizes(venv_path: String) -> Result<HashMap<String, f64>, String> 
                 let pkg_path = pkg.path();
                 let name = pkg.file_name().to_string_lossy().to_string();
                 if !name.ends_with(".dist-info") && !name.starts_with("__") {
-                    let size = fs_extra::dir::get_size(&pkg_path).unwrap_or(0);
-                    sizes.insert(name, (size as f64) / 1024.0 / 1024.0);
+                    sizes.insert(name, safe_dir_size_mb(&pkg_path, 120_000));
                 }
             }
         }
@@ -215,19 +233,38 @@ services:
 // --- Standard Commands ---
 
 #[tauri::command]
-fn check_venv_health(venv_path: String) -> Result<String, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    let pip = get_pip_path(&venv);
-    let out = Command::new(pip).arg("check").output().map_err(|e| e.to_string())?;
-    if out.status.success() { Ok("No conflicts found.".into()) } else { Ok(String::from_utf8_lossy(&out.stdout).to_string()) }
+async fn check_venv_health(venv_path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        let pip = get_pip_path(&venv);
+        let out = Command::new(pip).arg("check").output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok("No conflicts found.".into())
+        } else if !out.stdout.is_empty() {
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            Ok(String::from_utf8_lossy(&out.stderr).to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage>, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    let pip = get_pip_path(&venv);
-    let out = Command::new(pip).args(["list", "--outdated", "--format=json"]).output().map_err(|e| e.to_string())?;
-    if out.status.success() { let pkgs: Vec<OutdatedPackage> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?; Ok(pkgs) } else { Ok(Vec::new()) }
+async fn list_outdated_packages(venv_path: String) -> Result<Vec<OutdatedPackage>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        let pip = get_pip_path(&venv);
+        let out = Command::new(pip).args(["list", "--outdated", "--format=json"]).output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            let pkgs: Vec<OutdatedPackage> = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+            Ok(pkgs)
+        } else {
+            Ok(Vec::new())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -384,31 +421,35 @@ pub struct ManagerStatus {
 }
 
 #[tauri::command]
-fn audit_security(venv_path: String) -> Result<serde_json::Value, String> {
-    let venv = ensure_venv_dir(&venv_path)?;
-    let python_path = get_python_path(&venv);
-    
-    // We try to run pip-audit as a module inside the venv for maximum accuracy
-    // Output is requested in JSON format for easy frontend parsing
-    let out = Command::new(python_path)
-        .args(["-m", "pip_audit", "--format", "json"])
-        .output()
-        .map_err(|e| e.to_string())?;
+async fn audit_security(venv_path: String) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let venv = ensure_venv_dir(&venv_path)?;
+        let python_path = get_python_path(&venv);
+        
+        // We try to run pip-audit as a module inside the venv for maximum accuracy
+        // Output is requested in JSON format for easy frontend parsing
+        let out = Command::new(python_path)
+            .args(["-m", "pip_audit", "--format", "json"])
+            .output()
+            .map_err(|e| e.to_string())?;
 
-    if out.status.success() {
-        serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
-    } else {
-        let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
-        if err_msg.contains("No module named pip_audit") {
-            Err("pip-audit not installed in this environment.".to_string())
+        if out.status.success() {
+            serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
         } else {
-            // pip-audit returns non-zero if vulnerabilities are found, but we still want the JSON from stdout
-            if !out.stdout.is_empty() {
-                return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+            let err_msg = String::from_utf8_lossy(&out.stderr).to_string();
+            if err_msg.contains("No module named pip_audit") {
+                Err("pip-audit not installed in this environment.".to_string())
+            } else {
+                // pip-audit returns non-zero if vulnerabilities are found, but we still want the JSON from stdout
+                if !out.stdout.is_empty() {
+                    return serde_json::from_slice(&out.stdout).map_err(|e| e.to_string());
+                }
+                Err(err_msg)
             }
-            Err(err_msg)
         }
-    }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -633,8 +674,7 @@ fn update_package(venv_path: String, package: String, engine: String) -> Result<
 #[tauri::command]
 fn get_venv_details(path: String) -> Result<VenvDetails, String> {
     let p = ensure_venv_dir(&path)?;
-    let size_bytes = fs_extra::dir::get_size(&p).unwrap_or(0);
-    let size_mb = (size_bytes as f64) / 1024.0 / 1024.0;
+    let size_mb = safe_dir_size_mb(&p, 300_000);
     let pip = get_pip_path(&p);
     let mut packages = Vec::new();
     if let Ok(output) = Command::new(pip).args(["list", "--format=freeze"]).output() {

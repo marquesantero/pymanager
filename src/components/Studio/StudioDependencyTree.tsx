@@ -7,12 +7,18 @@ interface StudioDependencyTreeProps {
   venv: VenvInfo;
 }
 
-const TreeItem: React.FC<{ node: any, depth: number }> = ({ node, depth }) => {
+const TreeItem: React.FC<{ node: any, depth: number }> = React.memo(({ node, depth }) => {
   const [isOpen, setIsOpen] = useState(false); // Lazy expansion
+  const [visibleChildren, setVisibleChildren] = useState(120); // Incremental rendering for huge dependency sets
   const hasChildren = node.dependencies && node.dependencies.length > 0;
   
   const name = node.package_name || node.name;
   const version = node.installed_version || node.version;
+  const deps = node.dependencies || [];
+
+  useEffect(() => {
+    if (isOpen) setVisibleChildren(120);
+  }, [isOpen, name]);
 
   return (
     <div className="ml-4">
@@ -36,14 +42,27 @@ const TreeItem: React.FC<{ node: any, depth: number }> = ({ node, depth }) => {
       {/* PERFORMANCE CRITICAL: Only render children if isOpen is true */}
       {isOpen && hasChildren && (
         <div className="border-l-2 border-slate-100 dark:border-slate-800 ml-3.5 mt-1 animate-in slide-in-from-left-2 duration-200">
-          {node.dependencies.map((dep: any, i: number) => (
+          {deps.slice(0, visibleChildren).map((dep: any, i: number) => (
             <TreeItem key={`${name}-${i}`} node={dep} depth={depth + 1} />
           ))}
+          {deps.length > visibleChildren && (
+            <div className="ml-6 py-2">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setVisibleChildren(prev => prev + 120);
+                }}
+                className="text-[10px] font-black uppercase tracking-wide text-blue-600 hover:underline"
+              >
+                Load more ({deps.length - visibleChildren} remaining)
+              </button>
+            </div>
+          )}
         </div>
       )}
     </div>
   );
-};
+});
 
 export const StudioDependencyTree: React.FC<StudioDependencyTreeProps> = ({ venv }) => {
   const [tree, setTree] = useState<any[]>([]);

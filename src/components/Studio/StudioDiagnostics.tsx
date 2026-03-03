@@ -15,12 +15,18 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
   const [loadingHealth, setLoadingHealth] = useState(false);
   const [loadingSecurity, setLoadingSecurity] = useState(false);
   const [securityError, setSecurityError] = useState<string | null>(null);
+  const [hasRunDiagnostics, setHasRunDiagnostics] = useState(false);
 
   const runFullDiagnostics = async () => {
     setLoadingHealth(true);
+    setHasRunDiagnostics(true);
     try {
-      setHealth(await invoke("check_venv_health", { venvPath: venv.path }));
-      setOutdatedPkgs(await invoke("list_outdated_packages", { venvPath: venv.path }));
+      const [healthText, outdated] = await Promise.all([
+        invoke<string>("check_venv_health", { venvPath: venv.path }),
+        invoke<OutdatedPackage[]>("list_outdated_packages", { venvPath: venv.path })
+      ]);
+      setHealth(healthText);
+      setOutdatedPkgs(outdated);
     } catch (err) {
       console.error(err);
     } finally {
@@ -42,8 +48,12 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
   };
 
   useEffect(() => {
-    runFullDiagnostics();
-  }, [venv]);
+    setHealth("");
+    setOutdatedPkgs([]);
+    setSecurityReport(null);
+    setSecurityError(null);
+    setHasRunDiagnostics(false);
+  }, [venv.path]);
 
   return (
     <div className="space-y-10 animate-in fade-in duration-500 text-slate-900 dark:text-slate-100">
@@ -54,12 +64,13 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
             <h3 className="font-black text-xs uppercase tracking-widest flex items-center gap-2">
               <CheckCircle2 size={16} className="text-green-500"/> Consistency Check
             </h3>
-            <button onClick={runFullDiagnostics} className="p-2 hover:bg-slate-100 dark:hover:bg-slate-800 rounded-xl transition-all">
-              <RefreshCcw size={14} className={loadingHealth ? "animate-spin" : ""}/>
+            <button onClick={runFullDiagnostics} className="flex items-center gap-2 px-3 py-1.5 bg-blue-600 text-white rounded-xl text-[10px] font-black uppercase tracking-wider hover:bg-blue-700 transition-all">
+              <RefreshCcw size={12} className={loadingHealth ? "animate-spin" : ""}/>
+              {loadingHealth ? "Running..." : "Run Diagnostics"}
             </button>
           </div>
           <pre className="text-[10px] font-mono p-4 bg-slate-50 dark:bg-slate-950 rounded-2xl border border-slate-100 dark:border-slate-800 overflow-auto max-h-32">
-            {health || "Running check..."}
+            {loadingHealth ? "Running check..." : hasRunDiagnostics ? (health || "No output") : "Click 'Run Diagnostics' to start."}
           </pre>
         </div>
 
@@ -68,13 +79,14 @@ export const StudioDiagnostics: React.FC<StudioDiagnosticsProps> = ({ venv }) =>
             <AlertCircle size={16} className="text-orange-500"/> Outdated Packages
           </h3>
           <div className="space-y-2 max-h-32 overflow-y-auto pr-2 scrollbar-thin">
-            {outdatedPkgs.map(pkg => (
+            {!hasRunDiagnostics && !loadingHealth && <p className="text-center text-[10px] text-slate-400 italic py-4">Run diagnostics to load outdated packages.</p>}
+            {hasRunDiagnostics && outdatedPkgs.map(pkg => (
               <div key={pkg.name} className="flex justify-between items-center p-3 bg-slate-50 dark:bg-slate-950/50 rounded-xl border border-slate-100 dark:border-slate-800">
                 <span className="text-[10px] font-black">{pkg.name}</span>
                 <span className="text-[9px] font-mono text-slate-400">{pkg.version} → <span className="text-blue-500">{pkg.latest_version}</span></span>
               </div>
             ))}
-            {outdatedPkgs.length === 0 && <p className="text-center text-[10px] text-slate-400 italic py-4">All packages are up to date.</p>}
+            {hasRunDiagnostics && !loadingHealth && outdatedPkgs.length === 0 && <p className="text-center text-[10px] text-slate-400 italic py-4">All packages are up to date.</p>}
           </div>
         </div>
       </div>
